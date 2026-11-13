@@ -1,0 +1,1318 @@
+﻿Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Web
+
+# Windows PowerShell 5.1 may otherwise negotiate an obsolete TLS version.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$port = if ($env:HF_DASHBOARD_PORT) { [int]$env:HF_DASHBOARD_PORT } else { 8766 }
+if ($port -ne 8766) { throw '副本服务仅允许8766端口，已停止；不会启动或修改主看板。' }
+$workbenchApiVersion = '2026-11-08-replica-v18'
+$runningBridgeHash = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($MyInvocation.MyCommand.Path)))).Replace('-','')
+$sourceRoot = if (-not [string]::IsNullOrWhiteSpace($env:HF_DASHBOARD_SOURCE_ROOT)) {
+    $env:HF_DASHBOARD_SOURCE_ROOT
+} elseif (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    $PSScriptRoot
+} else {
+    Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+$sourceRoot = [IO.Path]::GetFullPath($sourceRoot)
+if($sourceRoot.TrimEnd('\','/') -ine ([IO.Path]::GetFullPath($PSScriptRoot)).TrimEnd('\','/')){throw 'INSTANCE_SOURCE_MISMATCH: 服务入口不能指定其他安装目录。'}
+$root = $env:HF_DASHBOARD_ROOT
+if ([string]::IsNullOrWhiteSpace($root)) { $root = Join-Path $sourceRoot 'instances\test' }
+. (Join-Path $PSScriptRoot 'instance-guard.ps1')
+Assert-WorkbenchPaths $sourceRoot $root $port 8766
+$env:HF_DASHBOARD_ROOT=$root
+$env:HF_DASHBOARD_PORT=[string]$port
+if (-not (Test-Path -LiteralPath $root)) { [void](New-Item -ItemType Directory -Path $root -Force) }
+$indexFile = Join-Path $sourceRoot 'index.html'
+$viewFile = Join-Path $sourceRoot 'view.html'
+$shareConfigFile = Join-Path $root 'share-config.json'
+$dashboardConfigFile = Join-Path $root 'dashboard-config.json'
+$dashboardConfigBackupFile = Join-Path $root 'dashboard-config.backup.json'
+$aiFeedbackFile = Join-Path $root 'ai-feedback.json'
+$dashboardUrl = 'https://alidocs.dingtalk.com/'
+$crmUrl = 'https://codecamp-crm.codemao.cn/layout/my-class'
+$rulesFile = 'C:\Users\user\.codex\skills\codemao-group-completion-dashboard\references\rules.md'
+$bundledPython = 'C:\Users\user\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+function Test-PythonRuntime([string]$candidate) {
+    if ([string]::IsNullOrWhiteSpace($candidate) -or -not (Test-Path -LiteralPath $candidate)) { return $false }
+    try {
+        $probe = Start-Process -FilePath $candidate -ArgumentList '--version' -WindowStyle Hidden -Wait -PassThru
+        return $probe.ExitCode -eq 0
+    } catch { return $false }
+}
+function Resolve-PythonRuntime {
+    $candidates = [Collections.Generic.List[string]]::new()
+    [void]$candidates.Add((Join-Path $sourceRoot 'runtime\python\python.exe'))
+    [void]$candidates.Add($bundledPython)
+    foreach ($base in @((Join-Path $env:LOCALAPPDATA 'Programs\Python'),$env:ProgramFiles)) {
+        if ($base -and (Test-Path -LiteralPath $base)) {
+            Get-ChildItem -LiteralPath $base -Filter python.exe -File -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | ForEach-Object { [void]$candidates.Add($_.FullName) }
+        }
+    }
+    $command = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($command) { [void]$candidates.Add($command.Source) }
+    foreach ($candidate in $candidates) { if (Test-PythonRuntime $candidate) { return $candidate } }
+    return $null
+}
+$python = Resolve-PythonRuntime
+if ([string]::IsNullOrWhiteSpace($python)) { throw '未找到可执行的 Python 环境。请重新运行“首次安装一键配置.bat”；已排除 Windows 应用商店的无效 Python 占位程序。' }
+$statusFile = Join-Path $root 'status.json'
+$scholarshipStatusFile = Join-Path $root 'scholarship-status.json'
+$scholarshipRunner = Join-Path $sourceRoot 'run-scholarship-update.ps1'
+$nctStatusFile = Join-Path $root 'nct-status.json'
+$nctRunner = Join-Path $sourceRoot 'run-nct-update.ps1'
+$serviceStatusFile = Join-Path $root 'service-status.json'
+$serviceDataFile = Join-Path $root 'service-data.json'
+$serviceRunner = Join-Path $sourceRoot 'run-service-update.ps1'
+$cohortExceptionStatusFile = Join-Path $root 'cohort-exception-status.json'
+$cohortExceptionRunner = Join-Path $sourceRoot 'run-cohort-exception-from-extension.ps1'
+$selfUpdateRunner = Join-Path $sourceRoot 'self-update.ps1'
+$selfUpdateStatusFile = Join-Path $root 'self-update-status.json'
+$bridgeErrorLog = Join-Path $root 'bridge-request-errors.log'
+$scheduleAttemptFile = Join-Path $root '.schedule-attempts.local.json'
+$extensionUploadDir = Join-Path $root 'run-data\extension-upload'
+$mcpRelayDir = Join-Path $root 'run-data\mcp-relay'
+$staleStageSeconds = 360
+$replicaStatusOwner = ''
+$utf8NoBom = [Text.UTF8Encoding]::new($false)
+if (-not (Test-Path -LiteralPath $dashboardConfigFile) -and (Test-Path -LiteralPath $dashboardConfigBackupFile)) {
+    Copy-Item -LiteralPath $dashboardConfigBackupFile -Destination $dashboardConfigFile -Force
+}
+if ((Test-Path -LiteralPath $dashboardConfigFile) -and -not (Test-Path -LiteralPath $dashboardConfigBackupFile)) {
+    Copy-Item -LiteralPath $dashboardConfigFile -Destination $dashboardConfigBackupFile -Force
+}
+if (-not (Test-Path -LiteralPath $extensionUploadDir)) { [void](New-Item -ItemType Directory -Path $extensionUploadDir -Force) }
+if (-not (Test-Path -LiteralPath $mcpRelayDir)) { [void](New-Item -ItemType Directory -Path $mcpRelayDir -Force) }
+
+function Send-Bytes($stream, [byte[]]$body, $contentType, $status = '200 OK') {
+    $head = "HTTP/1.1 $status`r`nContent-Type: $contentType`r`nContent-Length: $($body.Length)`r`nCache-Control: no-store`r`nX-Content-Type-Options: nosniff`r`nX-Frame-Options: DENY`r`nReferrer-Policy: no-referrer`r`nConnection: close`r`n`r`n"
+    $header = [Text.Encoding]::ASCII.GetBytes($head)
+    try {
+        $stream.Write($header,0,$header.Length)
+        $stream.Write($body,0,$body.Length)
+    } catch [IO.IOException] {
+        # Browsers cancel superseded polling requests.  That is a transport
+        # event after the operation has completed, not an update failure.
+        return
+    } catch [ObjectDisposedException] {
+        return
+    }
+}
+
+function Start-SelfUpdate {
+    if (-not (Test-Path -LiteralPath $selfUpdateRunner)) { throw '未找到一键更新脚本。' }
+    $running = $null
+    if (Test-Path -LiteralPath $selfUpdateStatusFile) {
+        try { $running = Get-Content -LiteralPath $selfUpdateStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    }
+    if ($running -and [string]$running.state -eq 'running' -and ((Get-Date)-(Get-Item -LiteralPath $selfUpdateStatusFile).LastWriteTime).TotalMinutes -lt 15) { return '更新任务已在运行。' }
+    $initial = [ordered]@{state='running';message='正在启动一键更新…';detail='校验更新包并备份程序；保留本机配置和运行数据。';time=(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')} | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($selfUpdateStatusFile,$initial,$utf8NoBom)
+    $instance = if ($env:HF_DASHBOARD_INSTANCE) { [string]$env:HF_DASHBOARD_INSTANCE } else { '' }
+    $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $selfUpdateRunner + '"'),'-InstallRoot',('"' + $sourceRoot + '"'),'-RuntimeRoot',('"' + $root + '"'),'-Port',[string]$port)
+    if (-not [string]::IsNullOrWhiteSpace($instance)) { $arguments += @('-Instance',$instance) }
+    $arguments += @('-ServicePid',[string]$PID)
+    Start-Process powershell.exe -ArgumentList $arguments -WindowStyle Hidden
+    return '一键更新已启动。'
+}
+
+function Start-TeacherBroadcast {
+    $runner = Join-Path $sourceRoot 'broadcast_report.py'
+    if (-not (Test-Path -LiteralPath $runner)) { throw '未找到通晒脚本。' }
+    $broadcastPython = $python
+    if (Test-Path -LiteralPath $bundledPython) { $broadcastPython = $bundledPython }
+    $pythonArgs = "`"$runner`" --send --force"
+    $outLog = Join-Path $root 'broadcast-out.log'
+    $errLog = Join-Path $root 'broadcast-err.log'
+    $process = Start-Process -FilePath $broadcastPython -ArgumentList $pythonArgs -WorkingDirectory $sourceRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    # Retain the native handle before waiting: Windows PowerShell can otherwise
+    # expose a null ExitCode for a process returned by Start-Process.
+    $processHandle = $process.Handle
+    if (-not $process.WaitForExit(90000)) { throw '发送仍在运行，请勿重复点击；请查看 broadcast-out.log。' }
+    $process.WaitForExit()
+    $process.Refresh()
+    if ($null -eq $process.ExitCode) { throw '无法确认发送进程退出状态，请核对发送日志；请勿重复点击。' }
+    if ($process.ExitCode -ne 0) { throw '通晒脚本执行失败，请查看 broadcast-err.log。' }
+    $result = Get-Content -LiteralPath $outLog -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($null -eq $result.cohortsSentThisRun -or [int]$result.cohortsSentThisRun -lt 0) { throw '发送结果校验失败，请核对日志；请勿重复点击。' }
+    $message = '已成功发送 ' + $result.cohortsSentThisRun + ' 个课期'
+    $schedule = Get-BroadcastSchedule
+    $schedule.lastResult = $message
+    $schedule | Add-Member -NotePropertyName lastSuccessTime -NotePropertyValue (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -Force
+    Save-BroadcastSchedule $schedule
+    return @{ok=$true; message=$message; sent=$result.cohortsSentThisRun}
+}
+
+function Get-BroadcastSchedule {
+    $file = Join-Path $root 'broadcast-schedule.local.json'
+    if (Test-Path $file) { return (Get-Content $file -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    return @{enabled=$false;times=@('14:00','18:00','20:00','21:00');lastAttempt='';lastResult='尚未运行'}
+}
+function Save-BroadcastSchedule($value) {
+    [IO.File]::WriteAllText((Join-Path $root 'broadcast-schedule.local.json'),($value | ConvertTo-Json -Depth 5),$utf8NoBom)
+}
+function Invoke-BroadcastSchedule {
+    
+    $now = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::UtcNow,'China Standard Time')
+    $minute = $now.ToString('yyyy-MM-dd HH:mm')
+    if ($script:lastBroadcastTick -eq $minute) { return }
+    $script:lastBroadcastTick=$minute
+    try {
+        $s=Get-BroadcastSchedule
+        if (-not $s.enabled -or $now.ToString('HH:mm') -notin @($s.times) -or $s.lastAttempt -eq $minute) { return }
+        $s.lastAttempt=$minute
+        $s.lastResult='正在发送'
+        Save-BroadcastSchedule $s
+        try { $result=Start-TeacherBroadcast; $s.lastResult=$result.message } catch { $s.lastResult='发送失败，请查看 broadcast-err.log' }
+        Save-BroadcastSchedule $s
+    } catch { Add-Content -LiteralPath $bridgeErrorLog -Value ('broadcast schedule: '+$_.Exception.Message) }
+}
+
+function Get-ShareConfig {
+    if (-not (Test-Path -LiteralPath $shareConfigFile)) { return $null }
+    try { return Get-Content -LiteralPath $shareConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { return $null }
+}
+
+function Test-EmbeddedMcpAuthorization([string]$connectionUrl) {
+    if ([string]::IsNullOrWhiteSpace($connectionUrl)) { return $false }
+    return $connectionUrl -match '^https://mcp-gw\.dingtalk\.com/' -and $connectionUrl -match '[?&]key=[^&]+'
+}
+
+function Get-DashboardConfig {
+    $defaults = [ordered]@{
+        displayTitle = '深圳战区 · 屹柯组'
+        displaySubtitle = '教学数据展示系统'
+        workbookUrl = $dashboardUrl
+        dingtalkConnectionUrl = ''
+        hasDingtalkAccessKey = $false
+        renewalWorkbookUrl = ''
+        renewalSheetId = ''
+        nctWorkbookUrl = ''
+        serviceWorkbookUrl = ''
+        doubaoModelId = ''
+        hasDoubaoApiKey = $false
+        classes = @()
+        excludedTeachers = @('薛超')
+        comparisonTeachers = @()
+        shareEnabled = $true
+        shareTitle = '深圳战区 · 屹柯组教学数据共享看板'
+        hasShareAccessKey = $false
+        isTestInstance = ($env:HF_DASHBOARD_INSTANCE -eq 'test' -or $root -ne $sourceRoot)
+        portableMode = $false
+    }
+    if (Test-Path -LiteralPath $dashboardConfigFile) {
+        try {
+            $saved = Get-Content -LiteralPath $dashboardConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($name in @('displayTitle','displaySubtitle','workbookUrl','dingtalkConnectionUrl','renewalWorkbookUrl','renewalSheetId','nctWorkbookUrl','serviceWorkbookUrl','doubaoModelId','classes','excludedTeachers','comparisonTeachers','shareEnabled','shareTitle','portableMode')) {
+                if ($null -ne $saved.$name) { $defaults[$name] = $saved.$name }
+            }
+            $defaults.hasDingtalkAccessKey = -not [string]::IsNullOrWhiteSpace([string]$saved.dingtalkAccessKey)
+            $defaults.hasDoubaoApiKey = -not [string]::IsNullOrWhiteSpace([string]$saved.doubaoApiKey)
+            if (Test-EmbeddedMcpAuthorization ([string]$saved.dingtalkConnectionUrl)) { $defaults.portableMode = $true }
+        } catch {}
+    }
+    $share = Get-ShareConfig
+    if ($share) {
+        $defaults.shareEnabled = $share.enabled -eq $true
+        if (-not [string]::IsNullOrWhiteSpace([string]$share.title)) { $defaults.shareTitle = [string]$share.title }
+        $defaults.hasShareAccessKey = -not [string]::IsNullOrWhiteSpace([string]$share.accessKey)
+    }
+    $issues = @()
+    $workbook = ([string]$defaults.workbookUrl).Trim()
+    if ([string]::IsNullOrWhiteSpace($workbook) -or $workbook -eq 'https://alidocs.dingtalk.com/' -or $workbook -match '请替换|请填写') { $issues += '教学数据钉钉文档链接' }
+    $hasLegacyConnection = $false # Replica never borrows main credentials.
+    if ([string]::IsNullOrWhiteSpace(([string]$defaults.dingtalkConnectionUrl).Trim()) -and -not $hasLegacyConnection) { $issues += '钉钉 MCP 连接地址' }
+    if (-not ($defaults.portableMode -eq $true -or $defaults.isTestInstance -eq $true -or $hasLegacyConnection) -and -not $defaults.hasDingtalkAccessKey) { $issues += '钉钉 MCP 访问密钥' }
+    $defaults.teachingConfigurationIssues = $issues
+    $defaults.teachingReady = ($issues.Count -eq 0)
+    return [pscustomobject]$defaults
+}
+
+function Save-DashboardConfig($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $workbook = [string]$payload.workbookUrl
+    if ($workbook -notmatch '^https://alidocs\.dingtalk\.com/') { throw '钉钉文档链接格式不正确。' }
+    $renewalWorkbook = ([string]$payload.renewalWorkbookUrl).Trim()
+    $nctWorkbook = ([string]$payload.nctWorkbookUrl).Trim()
+    $serviceWorkbook = ([string]$payload.serviceWorkbookUrl).Trim()
+    foreach ($candidate in @($renewalWorkbook,$nctWorkbook,$serviceWorkbook)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and $candidate -notmatch '^https://alidocs\.dingtalk\.com/') { throw '续费、等考招考或教学服务文档链接格式不正确。' }
+    }
+    $classes = @()
+    foreach ($pair in @($payload.classes)) {
+        if (@($pair).Count -lt 2) { throw '班级配置必须是“班级ID,主课期ID”。' }
+        $classId = 0; $termId = 0
+        if (-not [int]::TryParse([string]$pair[0],[ref]$classId) -or -not [int]::TryParse([string]$pair[1],[ref]$termId) -or $classId -le 0 -or $termId -le 0) { throw '班级 ID 和主课期 ID 必须是正整数。' }
+        $classes += ,@($classId,$termId)
+    }
+    $existingShare = Get-ShareConfig
+    $shareKey = [string]$payload.shareAccessKey
+    if ([string]::IsNullOrWhiteSpace($shareKey) -and $existingShare) { $shareKey = [string]$existingShare.accessKey }
+    if ($payload.shareEnabled -eq $true -and [string]::IsNullOrWhiteSpace($shareKey)) { throw '启用组员共享时必须填写访问密钥。' }
+    $existingConfig = $null
+    if (Test-Path -LiteralPath $dashboardConfigFile) { try { $existingConfig = Get-Content -LiteralPath $dashboardConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
+    $connectionUrl = ([string]$payload.dingtalkConnectionUrl).Trim()
+    $connectionKey = if ($existingConfig) { [string]$existingConfig.dingtalkAccessKey } else { '' }
+    $doubaoKey = ([string]$payload.doubaoApiKey).Trim()
+    if ([string]::IsNullOrWhiteSpace($doubaoKey) -and $existingConfig) { $doubaoKey = [string]$existingConfig.doubaoApiKey }
+    $portableMode = ($payload.portableMode -eq $true) -or ($existingConfig -and $existingConfig.portableMode -eq $true) -or (Test-EmbeddedMcpAuthorization $connectionUrl) -or ($env:HF_DASHBOARD_INSTANCE -eq 'test') -or ($root -ne $sourceRoot)
+    if (-not [string]::IsNullOrWhiteSpace($connectionUrl) -and $connectionUrl -notmatch '^https://') { throw '钉钉连接地址必须使用 HTTPS。' }
+    if (-not [string]::IsNullOrWhiteSpace($workbook) -and $workbook -ne $dashboardUrl) {
+        $missing = @()
+        if ([string]::IsNullOrWhiteSpace($connectionUrl)) { $missing += '钉钉 MCP 连接地址' }
+        if (-not $portableMode -and [string]::IsNullOrWhiteSpace($connectionKey)) { $missing += '钉钉 MCP 访问密钥' }
+        if ($missing.Count -gt 0) { throw ('教学数据配置尚未完成，缺少：' + ($missing -join '、')) }
+    }
+    $config = [ordered]@{
+        displayTitle = ([string]$payload.displayTitle).Trim()
+        displaySubtitle = ([string]$payload.displaySubtitle).Trim()
+        workbookUrl = $workbook.Trim()
+        dingtalkConnectionUrl = $connectionUrl
+        dingtalkAccessKey = $connectionKey
+        portableMode = $portableMode
+        renewalWorkbookUrl = $renewalWorkbook
+        renewalSheetId = ([string]$payload.renewalSheetId).Trim()
+        nctWorkbookUrl = $nctWorkbook
+        serviceWorkbookUrl = $serviceWorkbook
+        doubaoModelId = ([string]$payload.doubaoModelId).Trim()
+        doubaoApiKey = $doubaoKey
+        classes = $classes
+        excludedTeachers = @($payload.excludedTeachers | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        comparisonTeachers = @($payload.comparisonTeachers | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+        shareEnabled = $payload.shareEnabled -eq $true
+        shareTitle = ([string]$payload.shareTitle).Trim()
+    }
+    $configJson = $config | ConvertTo-Json -Depth 6
+    $configTemp = $dashboardConfigFile + '.tmp'
+    [IO.File]::WriteAllText($configTemp,$configJson,$utf8NoBom)
+    Move-Item -LiteralPath $configTemp -Destination $dashboardConfigFile -Force
+    [IO.File]::WriteAllText($dashboardConfigBackupFile,$configJson,$utf8NoBom)
+    $share = [ordered]@{ enabled=$config.shareEnabled; accessKey=$shareKey; title=$config.shareTitle }
+    [IO.File]::WriteAllText($shareConfigFile,($share | ConvertTo-Json -Depth 4),$utf8NoBom)
+    return '配置已保存；下次更新将使用新配置。'
+}
+
+function Expand-AiFeedbackItem($item) {
+    if ($null -eq $item) { return }
+    if ($null -ne $item.id -and $null -ne $item.question -and $null -ne $item.feedback) { Write-Output $item; return }
+    if ($null -ne $item.value) { foreach ($child in @($item.value)) { Expand-AiFeedbackItem $child } }
+}
+
+function Get-AiFeedback {
+    if (-not (Test-Path -LiteralPath $aiFeedbackFile)) { return @() }
+    try {
+        $parsed = Get-Content -LiteralPath $aiFeedbackFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $flat = @($parsed | ForEach-Object { Expand-AiFeedbackItem $_ })
+        return $flat
+    } catch { return @() }
+}
+
+function Invoke-DoubaoAnalysis($bodyText) {
+    $request = $bodyText | ConvertFrom-Json
+    $question = ([string]$request.question).Trim()
+    if ([string]::IsNullOrWhiteSpace($question)) { throw '请输入需要分析的问题。' }
+    if ($question.Length -gt 2000) { throw '问题不能超过 2000 个字符。' }
+    if (-not (Test-Path -LiteralPath $dashboardConfigFile)) { throw '请先在配置面板填写豆包模型 ID 和 API Key。' }
+    $config = Get-Content -LiteralPath $dashboardConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $model = ([string]$config.doubaoModelId).Trim()
+    $apiKey = ([string]$config.doubaoApiKey).Trim()
+    if ([string]::IsNullOrWhiteSpace($model) -or [string]::IsNullOrWhiteSpace($apiKey)) { throw '请先在配置面板填写豆包模型 ID 和 API Key。' }
+    $snapshotFile = Join-Path $root 'dashboard-snapshot.json'
+    if (-not (Test-Path -LiteralPath $snapshotFile)) { throw '尚无教学看板数据，请先执行一次组内教学数据更新。' }
+    $source = Get-Content -LiteralPath $snapshotFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    $compactRows = @($source.rows | ForEach-Object {
+        $row = $_
+        [ordered]@{
+            teacher = $row.teacher; cohort = $row.cohort; currentWeek = $row.currentWeek; recentClassTime = $row.recentClassTime
+            current = [ordered]@{
+                arrivalExpected=$row.current.arrivalExpected; arrivalAttend=$row.current.arrivalAttend; arrivalRate=$row.current.arrivalRate
+                liveExpected=$row.current.liveExpected; liveAttend=$row.current.liveAttend; liveRate=$row.current.liveRate; liveAbsentStudents=$row.current.liveAbsentStudents
+                replayAttend=$row.current.replayAttend; replayRate=$row.current.replayRate; replayStudents=$row.current.replayStudents
+                evenExpected=$row.current.evenExpected; evenDone=$row.current.evenDone; finishRate=$row.current.finishRate; incompleteStudents=$row.current.incompleteStudents
+                arrivedIncompleteStudents=$row.current.arrivedIncompleteStudents
+            }
+            previous = [ordered]@{ liveRate=$row.previous.liveRate; replayRate=$row.previous.replayRate; finishRate=$row.previous.finishRate }
+            gaps = [ordered]@{ liveDelta=$row.liveDelta; replayDelta=$row.replayDelta; finishDelta=$row.finishDelta; cohortLiveGap=$row.cohortLiveGap; cohortFinishGap=$row.cohortFinishGap }
+            anomalies = [ordered]@{ live=$row.liveAnomaly; finish=$row.finishAnomaly }
+            service = $row.service
+            riskStudents = [ordered]@{
+                liveAbsent=@($row.current.liveAbsentList | Select-Object -First 8 | ForEach-Object { [ordered]@{name=$_.name;id=$_.id} })
+                incomplete=@($row.current.incompleteList | Select-Object -First 8 | ForEach-Object { [ordered]@{name=$_.name;id=$_.id} })
+                replay=@($row.current.replayList | Select-Object -First 8 | ForEach-Object { [ordered]@{name=$_.name;id=$_.id} })
+            }
+        }
+    })
+    $compact = [ordered]@{ updatedAt=$source.updatedAt; weeks=$source.weeks; summary=$source.summary; cohorts=$source.cohorts; teachers=$compactRows }
+    $snapshot = $compact | ConvertTo-Json -Depth 10 -Compress
+    $systemPrompt = '你是屹柯组教学数据分析助手。请严格依据给定看板数据回答，优先识别异常老师、异常指标、同期差距和可执行跟进建议。不得编造数据；数据不足时明确说明。使用简洁中文，先给结论，再给证据与建议。'
+    $userPrompt = "用户问题：$question`n`n当前屹柯组教学看板摘要 JSON（风险学员名单每类最多展示8人）：`n$snapshot"
+    $payload = @{ model=$model; messages=@(@{role='system';content=$systemPrompt},@{role='user';content=$userPrompt}); temperature=0.2 } | ConvertTo-Json -Depth 8 -Compress
+    $headers = @{ Authorization = "Bearer $apiKey"; 'Content-Type' = 'application/json' }
+    try {
+        $response = Invoke-RestMethod -Method Post -Uri 'https://ark.cn-beijing.volces.com/api/v3/chat/completions' -Headers $headers -Body ([Text.Encoding]::UTF8.GetBytes($payload)) -TimeoutSec 60
+    } catch {
+        $detail = [string]$_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $detail = [string]$_.ErrorDetails.Message }
+        if ($detail -match 'NoAvailableModel') {
+            $detail = "当前模型 ID（$model）没有可用模型。请在火山方舟控制台确认推理接入点已启用且模型部署可用，或改填一个可用的模型名称/推理接入点 ID。"
+        } elseif ($detail -match 'AuthenticationError|Unauthorized|API key.*invalid') {
+            $detail = 'API Key 无效或没有该模型的调用权限，请在火山方舟控制台重新创建并填写 API Key。'
+        }
+        if ($detail -match '访问权限不允许|access.*socket|Unable to connect|无法连接到远程服务器') {
+            $detail = '当前工作台后台没有外网访问权限或被防火墙拦截。请关闭工作台后重新双击“启动组长工作台.bat”；若仍失败，请允许 PowerShell 访问 ark.cn-beijing.volces.com:443。'
+        }
+        throw "豆包请求失败：$detail"
+    }
+    $answer = [string]$response.choices[0].message.content
+    if ([string]::IsNullOrWhiteSpace($answer)) { throw '豆包未返回有效内容，请检查模型 ID 是否可用。' }
+    $items = [Collections.Generic.List[object]]::new()
+    foreach ($item in @(Get-AiFeedback)) { [void]$items.Add($item) }
+    $entry = [ordered]@{ id=[Guid]::NewGuid().ToString('N'); time=(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); question=$question; feedback=$answer; model=$model }
+    [void]$items.Insert(0,[pscustomobject]$entry)
+    while ($items.Count -gt 100) { $items.RemoveAt($items.Count - 1) }
+    $feedbackJson = ConvertTo-Json -InputObject @($items.ToArray()) -Depth 6
+    [IO.File]::WriteAllText($aiFeedbackFile,$feedbackJson,$utf8NoBom)
+    return $entry
+}
+
+function Send-AiFeedback($stream) {
+    $payloadObject = [ordered]@{ rows=@(Get-AiFeedback) }
+    $payload = ConvertTo-Json -InputObject $payloadObject -Depth 6 -Compress
+    Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
+}
+
+function Test-ShareKey($query) {
+    $config = Get-ShareConfig
+    if ($null -eq $config -or $config.enabled -ne $true -or [string]::IsNullOrWhiteSpace([string]$config.accessKey)) { return $false }
+    $params = [Web.HttpUtility]::ParseQueryString($query)
+    return [string]$params['key'] -ceq [string]$config.accessKey
+}
+
+function Test-IsLoopback($address) {
+    if ($null -eq $address) { return $false }
+    if ($address.IsIPv4MappedToIPv6) { $address = $address.MapToIPv4() }
+    return [Net.IPAddress]::IsLoopback($address)
+}
+
+function Read-StatusObject {
+    if (-not (Test-Path -LiteralPath $statusFile)) { return $null }
+    try { return Get-Content -LiteralPath $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { return $null }
+}
+
+function Write-StatusObject($state, $message, $detail = '', $startedAt = '', $phase = '') {
+    if ([string]::IsNullOrWhiteSpace([string]$startedAt)) { $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    $previous = Read-StatusObject
+    $lastSuccessTime = if ($previous -and $previous.lastSuccessTime) { [string]$previous.lastSuccessTime } elseif ($previous -and [string]$previous.state -eq 'success') { [string]$previous.time } else { '' }
+    if ([string]$state -eq 'success') { $lastSuccessTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    $status = [ordered]@{
+        state = [string]$state
+        message = [string]$message
+        detail = [string]$detail
+        time = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        startedAt = [string]$startedAt
+        phase = [string]$phase
+        lastSuccessTime = $lastSuccessTime
+    } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($statusFile,$status,$utf8NoBom)
+}
+
+function Write-ScholarshipStatusObject($state, $message, $detail = '', $startedAt = '') {
+    if ([string]::IsNullOrWhiteSpace([string]$startedAt)) { $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    $status = [ordered]@{
+        state = [string]$state
+        message = [string]$message
+        detail = [string]$detail
+        time = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        startedAt = [string]$startedAt
+    } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($scholarshipStatusFile,$status,$utf8NoBom)
+}
+
+function Read-ScholarshipStatusObject {
+    if (-not (Test-Path -LiteralPath $scholarshipStatusFile)) { return $null }
+    try { return Get-Content -LiteralPath $scholarshipStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { return $null }
+}
+
+function Repair-ScholarshipStatus {
+    $status = Read-ScholarshipStatusObject
+    if ($null -eq $status -or [string]$status.state -ne 'running') { return }
+    try {
+        $lastChange = [DateTime]::ParseExact([string]$status.time,'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture)
+        if (((Get-Date) - $lastChange).TotalMinutes -gt 10) {
+            Write-ScholarshipStatusObject 'error' '续费表格数据更新已超时' '超过10分钟没有返回结果，可以重新点击更新。' ([string]$status.startedAt)
+        }
+    } catch {}
+}
+
+function Send-ScholarshipStatus($stream) {
+    Repair-ScholarshipStatus
+    if (-not (Test-Path -LiteralPath $scholarshipStatusFile)) {
+        $payload = [ordered]@{state='idle';message='等待更新续费表格数据';detail='请在工作台选择续费月份 · 首续 · 深圳战区';time='';startedAt=''} | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
+        return
+    }
+    Send-File $stream $scholarshipStatusFile 'application/json; charset=utf-8'
+}
+
+function Invoke-ScholarshipExtensionUpdate($bodyText) {
+    Repair-ScholarshipStatus
+    $current = Read-ScholarshipStatusObject
+    if ($null -ne $current -and [string]$current.state -eq 'running') { throw '续费表格数据正在更新，请等待本轮完成。' }
+    if (-not (Test-Path -LiteralPath $scholarshipRunner)) { throw '本地续费表格更新运行器不存在。' }
+    $payload = $bodyText | ConvertFrom-Json
+    $bytes = [Convert]::FromBase64String([string]$payload.data)
+    $jsonText = [Text.Encoding]::UTF8.GetString($bytes)
+    $parsed = $jsonText | ConvertFrom-Json
+    if ($null -eq $parsed -or $null -eq $parsed.headers -or $null -eq $parsed.rows -or $parsed.rows.Count -eq 0) { throw '当前 Chrome CRM 页面返回了空数据。' }
+    $renewalMonth = [string]$payload.renewalMonth
+    if ($renewalMonth -notmatch '^\d{4}-(0[1-9]|1[0-2])-01$') { throw '请选择有效的续费月份。' }
+    if ([string]$parsed.renewalMonth -ne $renewalMonth) { throw '续费月份校验不一致，已停止写入。' }
+    if ([int]$parsed.renewalScope.version -ne 1 -or [string]$parsed.renewalScope.groupScope -ne 'all' -or
+        [string]$parsed.renewalScope.region -ne '深圳战区' -or [string]$parsed.renewalScope.node -ne '首续' -or
+        [string]$parsed.renewalScope.month -ne $renewalMonth) {
+        throw '续费采集范围未确认，已停止写入。请安装副本专用连接器1.6.77并刷新页面后重试。'
+    }
+    $sourceFile = Join-Path $root 'renewal-table-source.json'
+    [IO.File]::WriteAllBytes($sourceFile,$bytes)
+    $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Write-ScholarshipStatusObject 'running' '当前 Chrome 数据已接收，正在更新续费表格…' "筛选：$renewalMonth · 首续 · 深圳战区" $startedAt
+    Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$scholarshipRunner+'"'),'-InputFile',('"'+$sourceFile+'"') -WindowStyle Hidden
+    return '当前 Chrome 数据已接收，续费表格更新已启动。'
+}
+
+function Write-NctStatusObject($state, $message, $detail = '', $startedAt = '', $phase = '') {
+    if ([string]::IsNullOrWhiteSpace([string]$startedAt)) { $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    $status = [ordered]@{state=[string]$state;phase=[string]$phase;message=[string]$message;detail=[string]$detail;time=(Get-Date -Format 'yyyy-MM-dd HH:mm:ss');startedAt=[string]$startedAt} | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($nctStatusFile,$status,$utf8NoBom)
+}
+
+function Read-NctStatusObject {
+    if (-not (Test-Path -LiteralPath $nctStatusFile)) { return $null }
+    try { return Get-Content -LiteralPath $nctStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
+}
+
+function Repair-NctStatus {
+    $status = Read-NctStatusObject
+    if ($null -eq $status -or [string]$status.state -ne 'running') { return }
+    try { $lastChange=[DateTime]::ParseExact([string]$status.time,'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture);if(((Get-Date)-$lastChange).TotalMinutes-gt 10){Write-NctStatusObject 'error' 'NCT年卡购买更新已超时' '超过10分钟没有返回结果，任务锁已自动解除。' ([string]$status.startedAt)}} catch {}
+}
+
+function Send-NctStatus($stream) {
+    Repair-NctStatus
+    if (-not (Test-Path -LiteralPath $nctStatusFile)) { Write-NctStatusObject 'idle' '尚未更新NCT年卡购买数据' '请先配置等考招考文档，并选择筛选条件。' }
+    $status = Read-NctStatusObject
+    if ($null -ne $status -and [string]$status.state -eq 'idle') {
+        $config = Get-DashboardConfig
+        $configured = -not [string]::IsNullOrWhiteSpace([string]$config.nctWorkbookUrl)
+        if ($configured -and ([string]$status.message -ne 'NCT年卡购买更新已配置' -or [string]$status.detail -match '配置')) {
+            Write-NctStatusObject 'idle' 'NCT年卡购买更新已配置' '请选择支付时间、订单状态和商品名称后点击更新。'
+        } elseif (-not $configured -and [string]$status.detail -notmatch '配置') {
+            Write-NctStatusObject 'idle' '尚未更新NCT年卡购买数据' '请先在配置面板填写等考招考文档链接。'
+        }
+    }
+    Send-File $stream $nctStatusFile 'application/json; charset=utf-8'
+}
+
+function Invoke-NctExtensionUpdate($bodyText) {
+    Repair-NctStatus
+    $current=Read-NctStatusObject
+    if($null-ne$current-and[string]$current.state-eq'running'-and[string]$current.phase-ne'client'){throw 'NCT年卡购买数据正在更新，请等待本轮完成。'}
+    if(-not(Test-Path -LiteralPath $nctRunner)){throw '本地NCT年卡更新运行器不存在。'}
+    $payload=$bodyText|ConvertFrom-Json;$bytes=[Convert]::FromBase64String([string]$payload.data);$parsed=[Text.Encoding]::UTF8.GetString($bytes)|ConvertFrom-Json
+    if($null-eq$parsed-or$null-eq$parsed.headers-or$null-eq$parsed.rows-or@($parsed.rows).Count-eq0){throw '当前Chrome CRM页面返回了空数据。'}
+    $filters=$payload.filters
+    if([string]$parsed.filters.startDate-ne[string]$filters.startDate-or[string]$parsed.filters.endDate-ne[string]$filters.endDate-or[string]$parsed.filters.orderStatus-ne[string]$filters.orderStatus-or[string]$parsed.filters.productName-ne[string]$filters.productName){throw 'NCT筛选条件校验不一致，已停止写入。'}
+    $sourceFile=Join-Path $root 'nct-table-source.json';[IO.File]::WriteAllBytes($sourceFile,$bytes);$startedAt=Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Write-NctStatusObject 'running' '当前Chrome订单数据已接收，正在写入年卡招考数据…' "支付时间 $($filters.startDate) 至 $($filters.endDate) · $($filters.orderStatus) · $($filters.productName)" $startedAt 'local'
+    Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$nctRunner+'"'),'-InputFile',('"'+$sourceFile+'"') -WindowStyle Hidden
+    return 'NCT年卡订单已接收，写入任务已启动。'
+}
+
+function Invoke-NctClientStatus($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $state = [string]$payload.state
+    if ($state -notin @('running','error')) { throw 'NCT客户端状态无效。' }
+    $message = if ([string]::IsNullOrWhiteSpace([string]$payload.message)) { if ($state -eq 'running') { '正在读取NCT年卡订单…' } else { 'NCT年卡购买更新未启动' } } else { [string]$payload.message }
+    $phase = if ($state -eq 'running') { 'client' } else { 'error' }
+    Write-NctStatusObject $state $message ([string]$payload.detail) ([string]$payload.startedAt) $phase
+    return 'NCT客户端状态已记录。'
+}
+
+function Invoke-ServiceExtensionUpdate($bodyText) {
+    Repair-ServiceStatus
+    $payload=$bodyText|ConvertFrom-Json
+    $current = if (Test-Path $serviceStatusFile) { try { Get-Content $serviceStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null } } else { $null }
+    $runId=[string]$payload.runId
+    # Older already-open dashboard pages do not send runId.  A client-stage
+    # update is still the same hand-off; accepting it avoids a self-deadlock
+    # until that tab is refreshed.  Writer-stage and different non-empty runs
+    # remain protected below.
+    $sameClientRun=$current-and[string]$current.state-eq'running'-and[string]$current.phase-eq'client'-and(
+        ([string]$current.runId-eq$runId)-or
+        [string]::IsNullOrWhiteSpace([string]$current.runId)-or
+        [string]::IsNullOrWhiteSpace($runId)
+    )
+    if ($current -and [string]$current.state -eq 'running' -and -not $sameClientRun) { throw '教学服务数据正在更新，请等待本轮完成。' }
+    $bytes=[Convert]::FromBase64String([string]$payload.data);$jsonText=[Text.Encoding]::UTF8.GetString($bytes);$parsed=$jsonText|ConvertFrom-Json
+    if(!$parsed -or !$parsed.im -or !$parsed.wecom){throw '当前Chrome返回的教学服务数据不完整。'}
+    $sourceFile=Join-Path $root 'service-source.json';[IO.File]::WriteAllBytes($sourceFile,$bytes);$startedAt=Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $lastSuccessTime=if($current-and$current.lastSuccessTime){[string]$current.lastSuccessTime}elseif($current-and[string]$current.state-eq'success'){[string]$current.time}else{''};$status=[ordered]@{state='running';phase='writer';runId=$runId;message='正在更新教学服务数据…';detail='只更新“教学服务数据”子表';time=$startedAt;startedAt=$startedAt;lastSuccessTime=$lastSuccessTime}|ConvertTo-Json -Compress;[IO.File]::WriteAllText($serviceStatusFile,$status,$utf8NoBom)
+    Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$serviceRunner+'"'),'-InputFile',('"'+$sourceFile+'"') -WindowStyle Hidden
+    return '教学服务数据已接收，正在更新子表。'
+}
+
+function Repair-ServiceStatus {
+    if (-not (Test-Path -LiteralPath $serviceStatusFile)) { return }
+    try {
+        $status = Get-Content -LiteralPath $serviceStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ([string]$status.state -ne 'running') { return }
+        $stamp = if ($status.time) { [string]$status.time } else { [string]$status.startedAt }
+        $lastChange = [DateTime]::ParseExact($stamp,'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture)
+        if (((Get-Date)-$lastChange).TotalMinutes -gt 8) {
+            $now=Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $repaired=[ordered]@{state='error';message='教学服务更新已超时并自动解除';detail='任务超过8分钟未完成；部分数据可能已写入，请查看日志后重新更新。';time=$now;startedAt=[string]$status.startedAt;lastSuccessTime=[string]$status.lastSuccessTime}|ConvertTo-Json -Compress
+            [IO.File]::WriteAllText($serviceStatusFile,$repaired,$utf8NoBom)
+        }
+    } catch {}
+}
+
+function Set-ServiceClientStatus($bodyText) {
+    $payload=$bodyText|ConvertFrom-Json;$now=Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $current=if(Test-Path $serviceStatusFile){try{Get-Content $serviceStatusFile -Raw -Encoding UTF8|ConvertFrom-Json}catch{$null}}else{$null}
+    $runId=[string]$payload.runId;$state=if([string]$payload.state-eq'running'){'running'}else{'error'}
+    if($current-and[string]$current.state-eq'running'){
+        if([string]$current.phase-eq'writer'){
+            if($state-eq'error'){return '教学服务写入已启动，已忽略客户端延迟错误。'}
+            throw '教学服务数据正在写入，请等待本轮完成。'
+        }
+        if([string]$current.phase-eq'client'-and-not [string]::IsNullOrWhiteSpace([string]$current.runId)-and-not [string]::IsNullOrWhiteSpace($runId)-and[string]$current.runId-ne$runId){throw '教学服务数据正在读取，请等待本轮完成。'}
+    }
+    $lastSuccessTime=if($current-and$current.lastSuccessTime){[string]$current.lastSuccessTime}elseif($current-and[string]$current.state-eq'success'){[string]$current.time}else{''}
+    $message=if($payload.message){[string]$payload.message}elseif($state-eq'running'){'正在读取当前Chrome中的IM与企微看板…'}else{'教学服务数据更新未启动'}
+    $startedAt=if($state-eq'running'){$now}elseif($current-and$current.startedAt){[string]$current.startedAt}else{$now}
+    $status=[ordered]@{state=$state;phase=if($state-eq'running'){'client'}else{'error'};runId=$runId;message=$message;detail=[string]$payload.detail;time=$now;startedAt=$startedAt;lastSuccessTime=$lastSuccessTime}|ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($serviceStatusFile,$status,$utf8NoBom);return '教学服务客户端状态已记录。'
+}
+
+function Repair-StaleStatus {
+    $status = Read-StatusObject
+    if ($null -eq $status -or ([string]$status.state -ne 'running' -and -not ($port -eq 8766 -and [string]$status.state -eq 'waiting'))) { return }
+    try {
+        # A live writer can legitimately take longer during remote throttling.
+        # Its exclusive lock is stronger evidence than an old progress time.
+        $taskLockPath = Join-Path $root 'update.lock'
+        if (Test-Path -LiteralPath $taskLockPath) {
+            try { $taskLockHandle=[IO.File]::Open($taskLockPath,'Open','ReadWrite','None'); $taskLockHandle.Dispose() } catch { return }
+        }
+        $lastChange = [DateTime]::ParseExact([string]$status.time,'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture)
+        $age = ((Get-Date) - $lastChange).TotalSeconds
+        if ($age -gt $staleStageSeconds) {
+            Write-StatusObject 'error' '更新已超时并自动解除。' '某个阶段连续6分钟没有进展，已停止等待；部分子表可能已更新，请查看日志后重试。' ([string]$status.startedAt) 'timeout'
+        }
+    } catch {}
+}
+
+function Test-RecentUpdateRunning {
+    Repair-StaleStatus
+    $status = Read-StatusObject
+    return $null -ne $status -and [string]$status.state -eq 'running'
+}
+
+function Send-SharedStatus($stream) {
+    Repair-StaleStatus
+    if (-not (Test-Path -LiteralPath $statusFile)) { Send-Json $stream '暂无更新状态。' '404 Not Found'; return }
+    try {
+        $source = Get-Content -LiteralPath $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $safe = [ordered]@{
+            state = [string]$source.state
+            message = [string]$source.message
+            detail = [string]$source.detail
+            time = [string]$source.time
+            startedAt = [string]$source.startedAt
+            phase = [string]$source.phase
+        } | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($safe)) 'application/json; charset=utf-8'
+    } catch { Send-Json $stream '读取更新状态失败。' '500 Internal Server Error' }
+}
+
+function Send-Json($stream, $message, $status = '200 OK') {
+    $json = @{ message = [string]$message } | ConvertTo-Json -Compress
+    Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($json)) 'application/json; charset=utf-8' $status
+}
+
+function Send-File($stream, $file, $contentType) {
+    if (-not (Test-Path -LiteralPath $file)) { Send-Json $stream 'Resource not found.' '404 Not Found'; return }
+    Send-Bytes $stream ([IO.File]::ReadAllBytes($file)) $contentType
+}
+
+function Clear-McpRelayStaleFiles {
+    if (-not (Test-Path -LiteralPath $mcpRelayDir)) { return }
+    $cutoff = (Get-Date).AddMinutes(-12)
+    Get-ChildItem -LiteralPath $mcpRelayDir -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff } | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+function Send-McpRelayNext($stream) {
+    Clear-McpRelayStaleFiles
+    if (-not (Test-Path -LiteralPath $mcpRelayDir)) { [void](New-Item -ItemType Directory -Path $mcpRelayDir -Force) }
+    $request = Get-ChildItem -LiteralPath $mcpRelayDir -Filter '*.request.json' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime |
+        Where-Object {
+            $base = $_.FullName -replace '\.request\.json$',''
+            -not (Test-Path -LiteralPath ($base + '.claimed')) -and -not (Test-Path -LiteralPath ($base + '.response.json'))
+        } |
+        Select-Object -First 1
+    if ($null -eq $request) {
+        $idle = @{ idle = $true } | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($idle)) 'application/json; charset=utf-8'
+        return
+    }
+    $base = $request.FullName -replace '\.request\.json$',''
+    [IO.File]::WriteAllText(($base + '.claimed'),(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),$utf8NoBom)
+    Send-File $stream $request.FullName 'application/json; charset=utf-8'
+}
+
+function Receive-McpRelayResult($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $id = [string]$payload.id
+    if ($id -notmatch '^[a-f0-9]{32}$') { throw 'Invalid MCP relay id.' }
+    if (-not (Test-Path -LiteralPath $mcpRelayDir)) { [void](New-Item -ItemType Directory -Path $mcpRelayDir -Force) }
+    $responseFile = Join-Path $mcpRelayDir ($id + '.response.json')
+    [IO.File]::WriteAllText($responseFile,($payload | ConvertTo-Json -Depth 20 -Compress),$utf8NoBom)
+    return 'MCP relay result received.'
+}
+
+function Send-ConsoleData($stream, $mode, $query) {
+    $api = Join-Path $sourceRoot 'console_data_api.py'
+    $response = Join-Path $root ('.console-response-' + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+        if ($mode -eq 'meta') {
+            & $python $api 'meta' $response
+        } else {
+            $params = [Web.HttpUtility]::ParseQueryString($query)
+            $name = $params['name']
+            $page = if ($params['page']) { $params['page'] } else { '1' }
+            $size = if ($params['size']) { $params['size'] } else { '50' }
+            $searchText = if ([string]::IsNullOrEmpty([string]$params['q'])) { '__EMPTY__' } else { [string]$params['q'] }
+            $cohort = if ([string]::IsNullOrEmpty([string]$params['cohort'])) { 'all' } else { [string]$params['cohort'] }
+            & $python $api 'table' $response $name $page $size $searchText $cohort
+        }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $response)) {
+            Send-Json $stream '控制台数据生成失败，已拒绝返回历史缓存。' '500 Internal Server Error'
+            return
+        }
+        Send-File $stream $response 'application/json; charset=utf-8'
+    } finally {
+        if (Test-Path -LiteralPath $response) { Remove-Item -LiteralPath $response -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Send-DashboardData($stream) {
+    $snapshotScript = Join-Path $sourceRoot 'get_dashboard_snapshot.py'
+    $snapshotFile = Join-Path $root 'dashboard-snapshot.json'
+    $serviceFile = Join-Path $root 'service-data.json'
+    $needsSnapshot = -not (Test-Path $snapshotFile)
+    if (-not $needsSnapshot -and (Test-Path -LiteralPath $serviceFile)) {
+        $snapshotTime = (Get-Item -LiteralPath $snapshotFile).LastWriteTimeUtc
+        $serviceTime = (Get-Item -LiteralPath $serviceFile).LastWriteTimeUtc
+        if ($serviceTime -gt $snapshotTime) { $needsSnapshot = $true }
+    }
+    if ($needsSnapshot) { & $python $snapshotScript }
+    Send-File $stream $snapshotFile 'application/json; charset=utf-8'
+}
+
+function Send-ServiceTeachingDates($stream) {
+    $rawFile = Join-Path $root 'run-data\group-lessons-raw.json'
+    if (-not (Test-Path -LiteralPath $rawFile)) {
+        $empty = @{ dates=@(); source='none'; message='尚未生成教学课次数据。' } | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($empty)) 'application/json; charset=utf-8'
+        return
+    }
+    try {
+        $now = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(8))
+        $items = [Collections.Generic.List[object]]::new()
+        $raw = Get-Content -LiteralPath $rawFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($block in @($raw)) {
+            foreach ($lesson in @($block.lessons)) {
+                $unlock = 0L
+                if (-not [Int64]::TryParse([string]$lesson.unlock_time,[ref]$unlock) -or $unlock -le 0) { continue }
+                $openedAt = [DateTimeOffset]::FromUnixTimeSeconds($unlock).ToOffset([TimeSpan]::FromHours(8))
+                if ($openedAt -gt $now) { continue }
+                $weekOffset = ([int]$openedAt.DayOfWeek + 6) % 7
+                $week = $openedAt.Date.AddDays(-$weekOffset).ToString('yyyy-MM-dd')
+                $date = $openedAt.ToString('yyyy-MM-dd')
+                [void]$items.Add([pscustomobject]@{ week=$week; date=$date })
+            }
+        }
+        if ($items.Count -eq 0) {
+            $empty = @{ dates=@(); source='openedTeachingDays'; message='尚未发现已开课日期。' } | ConvertTo-Json -Compress
+            Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($empty)) 'application/json; charset=utf-8'
+            return
+        }
+        $latestWeek = [string](@($items | Sort-Object week -Descending | Select-Object -First 1)[0].week)
+        $dates = @($items | Where-Object { [string]$_.week -eq $latestWeek } | Select-Object -ExpandProperty date -Unique | Sort-Object)
+        $payload = [ordered]@{
+            dates = $dates
+            week = $latestWeek
+            source = 'openedTeachingDays'
+            updatedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        } | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
+    } catch {
+        Send-Json $stream ('读取已开课日期失败：' + $_.Exception.Message) '500 Internal Server Error'
+    }
+}
+
+function Test-ScheduledSlotAlreadyCompleted($slotKey) {
+    if ([string]::IsNullOrWhiteSpace([string]$slotKey) -or [string]$slotKey -like 'codemao-update-manual-*' -or [string]$slotKey -eq 'manual') { return $false }
+    $match = [regex]::Match([string]$slotKey, '^codemao-(?:test-)?update-\d-(\d{2})(\d{2})\|(\d{4}-\d{2}-\d{2})$')
+    if (-not $match.Success) { return $false }
+    $status = Read-StatusObject
+    if ($null -eq $status -or [string]$status.state -ne 'success' -or [string]$status.phase -ne 'service' -or [string]::IsNullOrWhiteSpace([string]$status.lastSuccessTime)) { return $false }
+    try {
+        $dueAt = [DateTime]::ParseExact(($match.Groups[3].Value + ' ' + $match.Groups[1].Value + ':' + $match.Groups[2].Value + ':00'),'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture)
+        $successAt = [DateTime]::ParseExact([string]$status.lastSuccessTime,'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture)
+        return $successAt -ge $dueAt
+    } catch { return $false }
+}
+
+function Get-ScheduleAttemptState {
+    if (-not (Test-Path -LiteralPath $scheduleAttemptFile)) { return @{} }
+    try {
+        $value = Get-Content -LiteralPath $scheduleAttemptFile -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+        if ($value -is [Collections.IDictionary]) { return $value }
+    } catch {}
+    return @{}
+}
+
+function Test-ScheduledSlotCoolingDown($slotKey) {
+    if ([string]::IsNullOrWhiteSpace([string]$slotKey) -or [string]$slotKey -like 'codemao-update-manual-*' -or [string]$slotKey -eq 'manual') { return $null }
+    $state = Get-ScheduleAttemptState
+    if (-not $state.ContainsKey([string]$slotKey)) { return $null }
+    $item = $state[[string]$slotKey]
+    try {
+        $lastAttempt = [DateTime]::ParseExact([string]$item.lastAttempt,'yyyy-MM-dd HH:mm:ss',[Globalization.CultureInfo]::InvariantCulture)
+        $remaining = 10 - [int][Math]::Floor(((Get-Date) - $lastAttempt).TotalMinutes)
+        if ([int]$item.count -ge 3) { return '同一自动更新时段已尝试3次，已停止重复执行；请稍后手动更新。' }
+        if ($remaining -gt 0) { return "同一自动更新时段刚刚执行过，跨浏览器冷却中（约 $remaining 分钟）。" }
+    } catch {}
+    return $null
+}
+
+function Register-ScheduledSlotAttempt($slotKey) {
+    if ([string]::IsNullOrWhiteSpace([string]$slotKey) -or [string]$slotKey -like 'codemao-update-manual-*' -or [string]$slotKey -eq 'manual') { return }
+    $state = Get-ScheduleAttemptState
+    $previous = if ($state.ContainsKey([string]$slotKey)) { $state[[string]$slotKey] } else { $null }
+    $count = if ($previous) { [int]$previous.count + 1 } else { 1 }
+    $state[[string]$slotKey] = @{ count=$count; lastAttempt=(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
+    [IO.File]::WriteAllText($scheduleAttemptFile,($state | ConvertTo-Json -Compress),$utf8NoBom)
+}
+
+$classPreparationJobs = @{}
+function Send-ClassPreparation($stream, [string]$response, [string]$scope = 'teaching') {
+    # Keep the HTTP listener free to serve the browser MCP relay while Python
+    # reads the current workbook. A synchronous read deadlocks that relay.
+    if (-not $classPreparationJobs.ContainsKey($response)) {
+        $prepareScript = Join-Path $sourceRoot 'prepare_extension_update.py'
+        $job = Start-Job -ArgumentList $python,$prepareScript,$response,$root -ScriptBlock {
+            param($runtime,$prepareScript,$response,$runtimeRoot)
+            $env:HF_DASHBOARD_ROOT = $runtimeRoot
+            $output = @(& $runtime '-X' 'utf8' $prepareScript $response 2>&1 | ForEach-Object { [string]$_ })
+            [pscustomobject]@{exitCode=$LASTEXITCODE;detail=($output -join "`n")}
+        }
+        $classPreparationJobs[$response] = @{job=$job;startedAt=(Get-Date)}
+    }
+    $entry = $classPreparationJobs[$response]
+    $job = $entry.job
+    if ($job.State -in @('NotStarted','Running') -and ((Get-Date)-$entry.startedAt).TotalSeconds -lt 110) {
+        # Older connectors retry a 503; a 202 would be mistaken for an empty
+        # class list before their extension reload has completed.
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes('{"preparing":true}')) 'application/json; charset=utf-8' '503 Service Unavailable'
+        return
+    }
+    $result = $null
+    if ($job.State -eq 'Completed') { $result = Receive-Job $job -ErrorAction SilentlyContinue | Select-Object -Last 1 }
+    else { Stop-Job $job -ErrorAction SilentlyContinue }
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    $classPreparationJobs.Remove($response)
+    if ($null -eq $result -or $result.exitCode -ne 0 -or -not (Test-Path -LiteralPath $response)) {
+        $detail = if ($result -and $result.detail) { [string]$result.detail } else { '读取最新班级明细超时或后台进程失败，请检查钉钉连接器后重试。' }
+        if ($scope -eq 'cohort') { Write-CohortExceptionStatus 'error' '班级明细读取失败，未使用旧名单。' $detail '' 'prepare' }
+        else { Write-StatusObject 'error' '班级明细读取失败，未使用旧名单。' $detail '' 'prepare' }
+        Send-Json $stream $detail '422 Unprocessable Entity'
+        return
+    }
+    Send-File $stream $response 'application/json; charset=utf-8'
+}
+
+function Send-ExtensionClasses($stream, $bodyText = '') {
+    $slotKey = 'manual'
+    try { if (-not [string]::IsNullOrWhiteSpace($bodyText)) { $slotKey = [string](($bodyText | ConvertFrom-Json).slotKey) } } catch {}
+    if ($port -eq 8766) {
+        $request = $null
+        try { $request = $bodyText | ConvertFrom-Json } catch {}
+        $owner = [string]$request.statusOwner
+        if (($slotKey -notlike 'manual*' -and $slotKey -ne 'comparison-manual') -or $owner -notmatch '^manual-[0-9]+-[a-f0-9]+$') {
+            Send-Json $stream '副本只允许新版连接器手动更新；旧自动任务已拒绝，不改变现有数据和状态。' '403 Forbidden'
+            return
+        }
+        if ($script:replicaStatusOwner -and $script:replicaStatusOwner -ne $owner -and (Test-RecentUpdateRunning)) {
+            Send-Json $stream '副本已有手动更新正在执行。' '409 Conflict'
+            return
+        }
+        $script:replicaStatusOwner = $owner
+        if ($slotKey -eq 'comparison-manual') { Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes('{"ok":true}')) 'application/json; charset=utf-8'; return }
+    }
+    $response = Join-Path $root 'extension-classes.json'
+    if ($classPreparationJobs.ContainsKey($response)) { Send-ClassPreparation $stream $response; return }
+    if (Test-ScheduledSlotAlreadyCompleted $slotKey) {
+        $status = Read-StatusObject
+        $payload = [ordered]@{alreadyCompleted=$true;lastSuccessTime=[string]$status.lastSuccessTime;slotKey=$slotKey} | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8'
+        return
+    }
+    $cooldown = Test-ScheduledSlotCoolingDown $slotKey
+    if (-not [string]::IsNullOrWhiteSpace([string]$cooldown)) {
+        $payload = [ordered]@{cooldown=$true;message=[string]$cooldown;slotKey=$slotKey} | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8' '429 Too Many Requests'
+        return
+    }
+    if (Test-RecentUpdateRunning) {
+        $status = Read-StatusObject
+        $payload = [ordered]@{alreadyRunning=$true;startedAt=[string]$status.startedAt;phase=[string]$status.phase;slotKey=$slotKey} | ConvertTo-Json -Compress
+        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($payload)) 'application/json; charset=utf-8' '202 Accepted'
+        return
+    }
+    $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Register-ScheduledSlotAttempt $slotKey
+    Write-StatusObject 'running' '正在通过连接器读取CRM最新数据…' '正在读取班级和直播数据，最长5分钟；请勿重复点击。' $startedAt 'crm'
+    Send-ClassPreparation $stream $response
+}
+
+function Write-CohortExceptionStatus($state, $message, $detail = '', $startedAt = '', $phase = '') {
+    if ([string]::IsNullOrWhiteSpace([string]$startedAt)) { $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    $previous = $null
+    if (Test-Path -LiteralPath $cohortExceptionStatusFile) {
+        try { $previous = Get-Content -LiteralPath $cohortExceptionStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    }
+    $lastSuccessTime = if ($previous -and $previous.lastSuccessTime) { [string]$previous.lastSuccessTime } elseif ($previous -and [string]$previous.state -eq 'success') { [string]$previous.time } else { '' }
+    if ([string]$state -eq 'success') { $lastSuccessTime = Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    $status = [ordered]@{
+        state=[string]$state; message=[string]$message; detail=[string]$detail
+        time=(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); startedAt=[string]$startedAt
+        phase=[string]$phase; lastSuccessTime=$lastSuccessTime
+    } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($cohortExceptionStatusFile,$status,$utf8NoBom)
+}
+
+function Send-CohortExceptionClasses($stream) {
+    $response = Join-Path $root 'cohort-exception-classes.json'
+    if ($classPreparationJobs.ContainsKey($response)) { Send-ClassPreparation $stream $response 'cohort'; return }
+    $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Write-CohortExceptionStatus 'running' '正在准备课期异常更新…' '仅读取班级配置，不会更新其他子表。' $startedAt 'prepare'
+    Send-ClassPreparation $stream $response 'cohort'
+}
+
+function Invoke-CohortExceptionUpdate($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $bytes = [Convert]::FromBase64String([string]$payload.data)
+    $jsonText = [Text.Encoding]::UTF8.GetString($bytes)
+    $parsed = $jsonText | ConvertFrom-Json
+    if ($null -eq $parsed -or $parsed.Count -eq 0) { throw '连接器返回的 CRM 数据为空。' }
+    $brokenNames = @($parsed | Where-Object { [string]$_.info.teacherName -match [char]0xFFFD })
+    if ($brokenNames.Count -gt 0) { throw 'CRM中文数据解码异常，已拒绝覆盖现有子表。' }
+    foreach ($block in $parsed) {
+        foreach ($attendance in @($block.liveAttendance.PSObject.Properties.Value)) {
+            $expected = @($attendance.expectedIds | ForEach-Object { [string]$_ } | Select-Object -Unique)
+            $attended = @($attendance.attendedIds | ForEach-Object { [string]$_ } | Select-Object -Unique)
+            if (@($attended | Where-Object { $expected -notcontains $_ }).Count -gt 0) { throw '直播名单校验失败：存在参播学员不在应到名单中。' }
+        }
+    }
+    $rawFile = Join-Path $root 'run-data\group-lessons-raw.json'
+    [IO.File]::WriteAllBytes($rawFile,$bytes)
+    $previous = $null
+    if (Test-Path -LiteralPath $cohortExceptionStatusFile) { try { $previous = Get-Content -LiteralPath $cohortExceptionStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
+    $startedAt = if ($previous -and $previous.startedAt) { [string]$previous.startedAt } else { Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    Write-CohortExceptionStatus 'running' 'CRM数据已接收，正在只写入“课期异常”…' '其他子表保持不变。' $startedAt 'writer'
+    Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$cohortExceptionRunner+'"'),'-RuntimeRoot',('"'+$root+'"') -WindowStyle Hidden
+    return '课期异常数据已接收，正在安全写入。'
+}
+
+function Commit-CohortExceptionChunks($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $uploadId = [string]$payload.uploadId
+    $total = [int]$payload.total
+    if ($uploadId -notmatch '^[a-zA-Z0-9-]{8,80}$' -or $total -lt 1 -or $total -gt 2000) { throw '无效的课期异常数据分片。' }
+    $builder = [Text.StringBuilder]::new()
+    try {
+        for ($index=0; $index -lt $total; $index++) {
+            $file = Join-Path $extensionUploadDir ($uploadId + '.' + $index.ToString('D5') + '.part')
+            if (-not (Test-Path -LiteralPath $file)) { throw "缺少数据分片：$($index + 1)/$total" }
+            [void]$builder.Append([IO.File]::ReadAllText($file,[Text.Encoding]::ASCII))
+        }
+        return Invoke-CohortExceptionUpdate (@{data=$builder.ToString()} | ConvertTo-Json -Compress)
+    } finally {
+        Get-ChildItem -LiteralPath $extensionUploadDir -Filter ($uploadId + '.*.part') -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-ExtensionUpdate($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $bytes = [Convert]::FromBase64String([string]$payload.data)
+    $jsonText = [Text.Encoding]::UTF8.GetString($bytes)
+    $parsed = $jsonText | ConvertFrom-Json
+    if ($null -eq $parsed -or $parsed.Count -eq 0) { throw 'The Chrome extension returned empty data.' }
+    $brokenNames = @($parsed | Where-Object { [string]$_.info.teacherName -match [char]0xFFFD })
+    if ($brokenNames.Count -gt 0) { throw 'CRM中文数据解码异常，已拒绝覆盖现有看板；请重新加载连接器后重试。' }
+    foreach ($block in $parsed) {
+        foreach ($attendance in @($block.liveAttendance.PSObject.Properties.Value)) {
+            $expected = @($attendance.expectedIds | ForEach-Object { [string]$_ } | Select-Object -Unique)
+            $attended = @($attendance.attendedIds | ForEach-Object { [string]$_ } | Select-Object -Unique)
+            if (@($attended | Where-Object { $expected -notcontains $_ }).Count -gt 0) { throw '直播名单校验失败：存在参播学员不在应到名单中，已拒绝覆盖现有看板。' }
+        }
+    }
+    $rawFile = Join-Path $root 'run-data\group-lessons-raw.json'
+    [IO.File]::WriteAllBytes($rawFile,$bytes)
+    $previous = Read-StatusObject
+    $startedAt = if ($previous -and $previous.startedAt) { [string]$previous.startedAt } else { Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    Write-StatusObject 'running' 'CRM数据已接收，正在启动本地计算…' '' $startedAt 'local'
+    $runner = Join-Path $sourceRoot 'run-direct-from-extension.ps1'
+    Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$runner+'"') -WindowStyle Hidden
+    return 'CRM data received. Building and syncing dashboards.'
+}
+
+function Receive-ExtensionChunk($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $uploadId = [string]$payload.uploadId
+    $index = [int]$payload.index
+    $total = [int]$payload.total
+    if ($uploadId -notmatch '^[a-zA-Z0-9-]{8,80}$' -or $total -lt 1 -or $total -gt 2000 -or $index -lt 0 -or $index -ge $total) { throw 'Invalid CRM upload chunk metadata.' }
+    $data = [string]$payload.data
+    if ([string]::IsNullOrEmpty($data) -or $data.Length -gt 400000) { throw 'Invalid CRM upload chunk size.' }
+    $file = Join-Path $extensionUploadDir ($uploadId + '.' + $index.ToString('D5') + '.part')
+    [IO.File]::WriteAllText($file,$data,[Text.Encoding]::ASCII)
+    return "CRM upload chunk $($index + 1)/$total received."
+}
+
+function Commit-ExtensionChunks($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    $uploadId = [string]$payload.uploadId
+    $total = [int]$payload.total
+    if ($uploadId -notmatch '^[a-zA-Z0-9-]{8,80}$' -or $total -lt 1 -or $total -gt 2000) { throw 'Invalid CRM upload commit metadata.' }
+    $builder = [Text.StringBuilder]::new()
+    try {
+        for ($index=0; $index -lt $total; $index++) {
+            $file = Join-Path $extensionUploadDir ($uploadId + '.' + $index.ToString('D5') + '.part')
+            if (-not (Test-Path -LiteralPath $file)) { throw "CRM upload chunk missing: $($index + 1)/$total" }
+            [void]$builder.Append([IO.File]::ReadAllText($file,[Text.Encoding]::ASCII))
+        }
+        $commitBody = @{ data=$builder.ToString() } | ConvertTo-Json -Compress
+        return Invoke-ExtensionUpdate $commitBody
+    } finally {
+        Get-ChildItem -LiteralPath $extensionUploadDir -Filter ($uploadId + '.*.part') -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-ExtensionStatus($bodyText) {
+    $payload = $bodyText | ConvertFrom-Json
+    if ($port -eq 8766 -and (-not $script:replicaStatusOwner -or [string]$payload.statusOwner -ne $script:replicaStatusOwner)) {
+        return '旧连接器或未准备的任务状态已忽略；副本只接受当前手动任务。'
+    }
+    $allowed = @('idle','running','waiting','success','error')
+    $state = [string]$payload.state
+    if ($allowed -notcontains $state) { $state = 'error' }
+    $previous = Read-StatusObject
+    $startedAt = if ($payload.startedAt) { [string]$payload.startedAt } elseif ($previous -and $previous.startedAt) { [string]$previous.startedAt } else { Get-Date -Format 'yyyy-MM-dd HH:mm:ss' }
+    $phase = if ($payload.phase) { [string]$payload.phase } else { [string]$previous.phase }
+    Write-StatusObject $state ([string]$payload.message) ([string]$payload.detail) $startedAt $phase
+    return 'Status recorded.'
+}
+
+function Invoke-LegacyUpdate {
+    $runner = Join-Path $root 'run-direct.ps1'
+    Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',('"'+$runner+'"') -WindowStyle Hidden
+    return 'Background update started.'
+}
+
+if (-not (Test-Path -LiteralPath $statusFile)) {
+    $initialConfig = Get-DashboardConfig
+    if ($initialConfig.teachingReady) {
+        Write-StatusObject 'idle' '工作台已就绪，尚未执行数据更新。' '请确认 Chrome 已登录 CRM 并已启用连接器。'
+    } else {
+        Write-StatusObject 'idle' '工作台已启动，教学数据配置尚未完成。' ('缺少：' + (@($initialConfig.teachingConfigurationIssues) -join '、'))
+    }
+}
+if (-not (Test-Path -LiteralPath $scholarshipStatusFile)) {
+    Write-ScholarshipStatusObject 'idle' '尚未配置或更新续费表格数据。' '请在配置面板填写专用续费工作簿和子表 ID。'
+}
+if (-not (Test-Path -LiteralPath $nctStatusFile)) {
+    Write-NctStatusObject 'idle' '尚未更新NCT年卡购买数据。' '请在配置面板填写等考招考文档链接。'
+}
+if (-not (Test-Path -LiteralPath $serviceStatusFile)) {
+    $serviceInitial = [ordered]@{state='idle';message='尚未更新教学服务数据。';detail='完成配置后可从当前 Chrome 页面更新。';time=(Get-Date -Format 'yyyy-MM-dd HH:mm:ss');startedAt='';lastSuccessTime=''} | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($serviceStatusFile,$serviceInitial,$utf8NoBom)
+}
+# Recover a stale task marker immediately when the isolated replica service
+# starts. A crashed process must not leave the UI showing a task forever.
+Repair-StaleStatus
+$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any,$port)
+try { $listener.Start() } catch { if ($env:HF_DASHBOARD_NO_OPEN -ne '1') { Start-Process "http://127.0.0.1:$port/" }; exit 0 }
+if ($env:HF_DASHBOARD_NO_OPEN -ne '1') { Start-Process "http://127.0.0.1:$port/" }
+
+while ($true) {
+    Invoke-BroadcastSchedule
+    if (-not $listener.Pending()) { Start-Sleep -Milliseconds 250; continue }
+    $client = $listener.AcceptTcpClient()
+    $stream = $null
+    try {
+        # A browser/extension can occasionally leave a half-open local socket.
+        # Bound every client so one abandoned request cannot block the entire
+        # single-process dashboard service indefinitely.
+        $client.ReceiveTimeout = 15000
+        $client.SendTimeout = 15000
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 15000
+        $stream.WriteTimeout = 15000
+        # Read headers and body as bytes. Content-Length is a byte count; using
+        # StreamReader characters here can deadlock on Chinese JSON payloads.
+        $headerBytes = [Collections.Generic.List[byte]]::new()
+        while ($true) {
+            $value = $stream.ReadByte()
+            if ($value -lt 0) { throw 'Client closed before sending headers.' }
+            $headerBytes.Add([byte]$value)
+            $count = $headerBytes.Count
+            if ($count -ge 4 -and $headerBytes[$count-4] -eq 13 -and $headerBytes[$count-3] -eq 10 -and $headerBytes[$count-2] -eq 13 -and $headerBytes[$count-1] -eq 10) { break }
+            if ($count -gt 65536) { throw 'HTTP headers are too large.' }
+        }
+        $headerText = [Text.Encoding]::ASCII.GetString($headerBytes.ToArray())
+        $headerLines = $headerText -split "`r`n"
+        $requestLine = $headerLines[0]
+        $headers = @{}
+        foreach ($line in $headerLines[1..($headerLines.Count-1)]) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $parts = $line -split ':',2
+            if ($parts.Count -eq 2) { $headers[$parts[0].Trim().ToLowerInvariant()] = $parts[1].Trim() }
+        }
+        $bodyText = ''
+        if ($headers.ContainsKey('content-length')) {
+            $length = [int]$headers['content-length']
+            if ($length -gt 0) {
+                if ($length -gt 104857600) { throw 'Request body is too large.' }
+                $buffer = New-Object byte[] $length
+                $read = 0
+                while ($read -lt $length) {
+                    $count = $stream.Read($buffer,$read,$length-$read)
+                    if ($count -le 0) { break }
+                    $read += $count
+                }
+                if ($read -ne $length) { throw 'Request body ended early.' }
+                $bodyText = [Text.Encoding]::UTF8.GetString($buffer)
+            }
+        }
+        $target = ($requestLine -split ' ')[1]
+        $method = ($requestLine -split ' ')[0].ToUpperInvariant()
+        $path = ($target -split '\?')[0]
+        $query = if ($target -like '*?*') { ($target -split '\?',2)[1] } else { '' }
+        $remoteAddress = $client.Client.RemoteEndPoint.Address
+        $isLocal = Test-IsLoopback $remoteAddress
+        $isSharedPath = $path -in @('/view','/shared/status','/shared/dashboard-data','/shared/console-meta','/shared/console-table')
+        $isPublicAsset = $path -eq '/assets/codemao-logo.png'
+        $shareAuthorized = $isSharedPath -and (Test-ShareKey $query)
+
+        # 局域网访问者只能进入带密钥的只读共享通道。所有更新、配置和打开外部系统的入口均只允许本机。
+        if (-not $isLocal -and -not $shareAuthorized -and -not $isPublicAsset) {
+            Send-Json $stream '无权访问。请使用管理员提供的完整共享链接。' '403 Forbidden'
+            continue
+        }
+        if (-not $isLocal -and $method -ne 'GET') {
+            Send-Json $stream '共享看板仅支持只读访问。' '405 Method Not Allowed'
+            continue
+        }
+        $writerPaths=@('/prepare-extension','/prepare-cohort-exception','/extension-data','/extension-data-commit','/cohort-exception-data-commit','/scholarship-extension-data','/service-extension-data','/nct-extension-data','/broadcast')
+        if ($method -eq 'POST' -and $path -in $writerPaths -and (Test-Path -LiteralPath $selfUpdateStatusFile)) {
+            $updating=$null
+            try { $updating=Get-Content -LiteralPath $selfUpdateStatusFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+            if ($updating -and $updating.state -eq 'running' -and ((Get-Date)-(Get-Item -LiteralPath $selfUpdateStatusFile).LastWriteTime).TotalMinutes -lt 15) {
+                Send-Json $stream '工作台程序正在升级，请完成后再更新数据。' '409 Conflict'
+                continue
+            }
+        }
+        switch ($path) {
+            '/broadcast-schedule' {
+                try {
+                    if ($method -eq 'POST') {
+                        
+                        $inputSchedule=$bodyText | ConvertFrom-Json
+                        $times=@($inputSchedule.times | Select-Object -Unique)
+                        if ($times.Count -lt 1 -or $times.Count -gt 12) { throw '请选择1至12个发送时间。' }
+                        foreach ($time in $times) { if ([string]$time -notmatch '^([01][0-9]|2[0-3]):[0-5][0-9]$') { throw '时间格式应为HH:mm。' } }
+                        $s=Get-BroadcastSchedule
+                        $s.enabled=[bool]$inputSchedule.enabled
+                        $s.times=$times
+                        Save-BroadcastSchedule $s
+                    } elseif ($method -ne 'GET') { throw '仅支持GET或POST。' }
+                    $scheduleJson=Get-BroadcastSchedule | ConvertTo-Json -Depth 5 -Compress
+                    Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($scheduleJson)) 'application/json; charset=utf-8'
+                } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' }
+            }
+            '/comparison-input' {
+                if ($method -ne 'GET') { Send-Json $stream '仅主看板可读取对比老师更新输入。' '403 Forbidden' }
+                else {
+                    $rawFile = Join-Path $root 'run-data\group-lessons-raw.json'
+                    $config = Get-Content -LiteralPath $dashboardConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $raw = Get-Content -LiteralPath $rawFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $body = @{blocks=@($raw);comparisonTeachers=@($config.comparisonTeachers)} | ConvertTo-Json -Depth 100 -Compress
+                    Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($body)) 'application/json; charset=utf-8'
+                }
+            }
+            '/health' {
+                $health = @{ ok=$true; instance='replica'; port=8766; apiVersion=$workbenchApiVersion; bridgeHash=$runningBridgeHash; sourceRoot=$sourceRoot; runtimeRoot=$root } | ConvertTo-Json -Compress
+                Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($health)) 'application/json; charset=utf-8'
+            }
+            '/' { Send-File $stream $indexFile 'text/html; charset=utf-8' }
+            '/view' {
+                if ($shareAuthorized -or $isLocal) { Send-File $stream $viewFile 'text/html; charset=utf-8' }
+                else { Send-Json $stream '共享密钥无效。' '403 Forbidden' }
+            }
+            '/assets/codemao-logo.png' { Send-File $stream (Join-Path $sourceRoot 'assets\codemao-logo.png') 'image/png' }
+            '/run' { Send-Json $stream (Invoke-LegacyUpdate) }
+            '/status' { Repair-StaleStatus; Send-File $stream $statusFile 'application/json; charset=utf-8' }
+            '/broadcast' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 发送通晒。' '405 Method Not Allowed' }
+                else { try { $broadcastJson=(Start-TeacherBroadcast | ConvertTo-Json -Compress); Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($broadcastJson)) 'application/json; charset=utf-8' } catch { Send-Json $stream $_.Exception.Message '500 Internal Server Error' } }
+            }
+            '/scholarship-status' { Send-ScholarshipStatus $stream }
+            '/nct-status' { Send-NctStatus $stream }
+            '/service-status' { Repair-ServiceStatus; Send-File $stream $serviceStatusFile 'application/json; charset=utf-8' }
+            '/cohort-exception-status' {
+                if (Test-Path -LiteralPath $cohortExceptionStatusFile) { Send-File $stream $cohortExceptionStatusFile 'application/json; charset=utf-8' }
+                else { Send-Json $stream '尚未执行课期异常更新。' }
+            }
+            '/service-data' { Send-File $stream $serviceDataFile 'application/json; charset=utf-8' }
+            '/self-update-status' {
+                if (Test-Path -LiteralPath $selfUpdateStatusFile) { Send-File $stream $selfUpdateStatusFile 'application/json; charset=utf-8' }
+                else { Send-Json $stream '尚未执行工作台更新。' }
+            }
+            '/self-update' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 启动更新。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Start-SelfUpdate) } catch { Send-Json $stream $_.Exception.Message '500 Internal Server Error' } }
+            }
+            '/config' {
+                if ($method -eq 'GET') {
+                    $configJson = Get-DashboardConfig | ConvertTo-Json -Depth 6 -Compress
+                    Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($configJson)) 'application/json; charset=utf-8'
+                } elseif ($method -eq 'POST') {
+                    try { Send-Json $stream (Save-DashboardConfig $bodyText) }
+                    catch { Send-Json $stream $_.Exception.Message '400 Bad Request' }
+                } else { Send-Json $stream 'Method not allowed.' '405 Method Not Allowed' }
+            }
+            '/run-scholarship' {
+                Send-Json $stream '续费数据必须通过当前 Chrome CRM 页面读取，请刷新控制台后重试。' '410 Gone'
+            }
+            '/scholarship-extension-data' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交当前 Chrome 数据。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Invoke-ScholarshipExtensionUpdate $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/nct-extension-data' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交当前 Chrome 的NCT订单数据。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Invoke-NctExtensionUpdate $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/nct-client-status' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交NCT更新状态。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Invoke-NctClientStatus $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/service-extension-data' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交当前Chrome数据。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Invoke-ServiceExtensionUpdate $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/service-client-status' { if($method-ne'POST'){Send-Json $stream 'Method not allowed' '405 Method Not Allowed'}else{try{Send-Json $stream (Set-ServiceClientStatus $bodyText)}catch{Send-Json $stream $_.Exception.Message '400 Bad Request'}} }
+            '/dashboard-data' { Send-DashboardData $stream }
+            '/service-teaching-dates' { Send-ServiceTeachingDates $stream }
+            '/ai-feedback' { Send-AiFeedback $stream }
+            '/ai-ask' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交问题。' '405 Method Not Allowed' }
+                else {
+                    try {
+                        $result = Invoke-DoubaoAnalysis $bodyText | ConvertTo-Json -Depth 6 -Compress
+                        Send-Bytes $stream ([Text.Encoding]::UTF8.GetBytes($result)) 'application/json; charset=utf-8'
+                    } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' }
+                }
+            }
+            '/prepare-extension' {
+                try { Send-ExtensionClasses $stream $bodyText }
+                catch {
+                    $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                    Write-StatusObject 'error' '更新准备失败。' ([string]$_.Exception.Message) $startedAt 'prepare'
+                    Send-Json $stream ([string]$_.Exception.Message) '500 Internal Server Error'
+                }
+            }
+            '/prepare-cohort-exception' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 启动课期异常更新。' '405 Method Not Allowed' }
+                else {
+                    try { Send-CohortExceptionClasses $stream }
+                    catch {
+                        $startedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                        Write-CohortExceptionStatus 'error' '课期异常更新准备失败。' ([string]$_.Exception.Message) $startedAt 'prepare'
+                        Send-Json $stream ([string]$_.Exception.Message) '500 Internal Server Error'
+                    }
+                }
+            }
+            '/extension-data' {
+                try { Send-Json $stream (Invoke-ExtensionUpdate $bodyText) }
+                catch { Send-Json $stream $_.Exception.Message '400 Bad Request' }
+            }
+            '/extension-data-chunk' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 上传数据分片。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Receive-ExtensionChunk $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/extension-data-commit' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交数据分片。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Commit-ExtensionChunks $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/cohort-exception-data-commit' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交课期异常数据分片。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Commit-CohortExceptionChunks $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/extension-status' {
+                try { Send-Json $stream (Set-ExtensionStatus $bodyText) }
+                catch { Send-Json $stream $_.Exception.Message '400 Bad Request' }
+            }
+            '/mcp-relay-next' { Send-McpRelayNext $stream }
+            '/mcp-relay-result' {
+                if ($method -ne 'POST') { Send-Json $stream '请使用 POST 提交钉钉中继结果。' '405 Method Not Allowed' }
+                else { try { Send-Json $stream (Receive-McpRelayResult $bodyText) } catch { Send-Json $stream $_.Exception.Message '400 Bad Request' } }
+            }
+            '/console-meta' { Send-ConsoleData $stream 'meta' '' }
+            '/console-table' { Send-ConsoleData $stream 'table' $query }
+            '/shared/status' {
+                if ($shareAuthorized) { Send-SharedStatus $stream }
+                else { Send-Json $stream '共享密钥无效。' '403 Forbidden' }
+            }
+            '/shared/dashboard-data' {
+                if ($shareAuthorized) { Send-DashboardData $stream }
+                else { Send-Json $stream '共享密钥无效。' '403 Forbidden' }
+            }
+            '/shared/console-meta' {
+                if ($shareAuthorized) { Send-ConsoleData $stream 'meta' '' }
+                else { Send-Json $stream '共享密钥无效。' '403 Forbidden' }
+            }
+            '/shared/console-table' {
+                if ($shareAuthorized) { Send-ConsoleData $stream 'table' $query }
+                else { Send-Json $stream '共享密钥无效。' '403 Forbidden' }
+            }
+            '/open/dashboard' { $cfg = Get-DashboardConfig; Start-Process ([string]$cfg.workbookUrl); Send-Json $stream 'DingTalk dashboard opened.' }
+            '/open/crm' { Start-Process $crmUrl; Send-Json $stream 'CRM opened.' }
+            '/open/rules' { Start-Process $rulesFile; Send-Json $stream 'Rules opened.' }
+            default { Send-Json $stream 'Operation not found.' '404 Not Found' }
+        }
+    } catch {
+        try { Add-Content -LiteralPath $bridgeErrorLog -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + " | " + $path + " | " + $_.Exception.Message) -Encoding UTF8 } catch {}
+        if ($stream) { try { Send-Json $stream 'Local service request failed.' '500 Internal Server Error' } catch {} }
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        $client.Dispose()
+    }
+}

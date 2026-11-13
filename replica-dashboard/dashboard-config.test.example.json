@@ -1,0 +1,13 @@
+{
+  "displayTitle": "教学数据工作台",
+  "displaySubtitle": "独立副本 · 请配置本组教学文档",
+  "workbookUrl": "",
+  "dingtalkConnectionUrl": "",
+  "portableMode": true,
+  "renewalWorkbookUrl": "",
+  "renewalSheetId": "",
+  "classes": [],
+  "excludedTeachers": ["薛超"],
+  "shareEnabled": false,
+  "shareTitle": "组内教学数据看板"
+}

@@ -1,0 +1,2 @@
+# Preserve release-manifest hashes and Windows script encodings byte for byte.
+* -text

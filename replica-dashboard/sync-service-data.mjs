@@ -1,0 +1,159 @@
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import {fileURLToPath} from "node:url";
+
+function isolatedRuntimeRoot(source, fallback, expectedPort){
+  if(String(process.env.HF_DASHBOARD_PORT||expectedPort)!==String(expectedPort))throw new Error("INSTANCE_PORT_MISMATCH");
+  const base=fs.realpathSync(source),candidate=path.resolve(process.env.HF_DASHBOARD_ROOT||fallback);
+  const relative=path.relative(base,candidate);
+  if(relative===".."||relative.startsWith(".."+path.sep)||path.isAbsolute(relative))throw new Error("INSTANCE_ROOT_MISMATCH");
+  let current=candidate;
+  while(true){
+    if(fs.existsSync(current)&&fs.lstatSync(current).isSymbolicLink())throw new Error("INSTANCE_ROOT_REPARSE_POINT");
+    const parent=path.dirname(current);if(parent===current)break;current=parent;
+  }
+  return candidate;
+}
+
+
+const DEFAULT_WORKBOOK="";
+const DASHBOARD_ROOT=isolatedRuntimeRoot(path.dirname(fileURLToPath(import.meta.url)),path.join(path.dirname(fileURLToPath(import.meta.url)),"instances","test"),8766);
+const DASHBOARD_CONFIG=path.join(DASHBOARD_ROOT,"dashboard-config.json");
+const TEACHING_TABLES=path.join(DASHBOARD_ROOT,"run-data","group-dashboard-tables.json");
+const MCP_RELAY_DIR=path.join(DASHBOARD_ROOT,"run-data","mcp-relay");
+const DASHBOARD_SETTINGS=(()=>{try{return JSON.parse(fs.readFileSync(DASHBOARD_CONFIG,"utf8"))}catch{return {}}})();
+const WORKBOOK=DASHBOARD_SETTINGS.serviceWorkbookUrl||DASHBOARD_SETTINGS.workbookUrl||DEFAULT_WORKBOOK;
+const SHEET_NAME="教学服务数据";
+const normalize=value=>String(value??"").replace(/\s+/g," ").trim();
+const csvEscape=value=>{const text=value==null?"":String(value);return /[",\r\n]/.test(text)?`"${text.replace(/"/g,'""')}"`:text;};
+const matrixToCsv=matrix=>matrix.map(row=>row.map(csvEscape).join(",")).join("\r\n");
+
+function credentials(){if(DASHBOARD_SETTINGS.dingtalkConnectionUrl)return {url:DASHBOARD_SETTINGS.dingtalkConnectionUrl,token:DASHBOARD_SETTINGS.dingtalkAccessKey||""};throw new Error("DINGTALK_MCP_CONFIG_NOT_FOUND:请在副本配置面板填写独立连接授权");}
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function networkError(error,url,name,attempts){const cause=error?.cause;let host="钉钉连接";try{host=new URL(url).host||host}catch{}const reason=[error?.message,cause?.code,cause?.message].filter(Boolean).join(" / ");return new Error(`DINGTALK_NETWORK_FAILED:${host}:${name}:已重试${attempts}次:${reason||"网络连接失败"}`);}
+async function mcpCallViaBrowserRelay(body,timeoutMs=180000){
+  fs.mkdirSync(MCP_RELAY_DIR,{recursive:true});
+  const id=crypto.randomBytes(16).toString("hex"),requestFile=path.join(MCP_RELAY_DIR,`${id}.request.json`),responseFile=path.join(MCP_RELAY_DIR,`${id}.response.json`),claimedFile=path.join(MCP_RELAY_DIR,`${id}.claimed`),temporary=`${requestFile}.tmp`;
+  const {url,token}=credentials();
+  const payload={id,url,token:token||"",bodyBase64:Buffer.from(body).toString("base64"),timeoutMs,createdAt:new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai"})};
+  fs.writeFileSync(temporary,JSON.stringify(payload),"utf8");
+  fs.renameSync(temporary,requestFile);
+  const deadline=Date.now()+timeoutMs+45000,claimDeadline=Date.now()+Math.min(20000,Math.max(5000,timeoutMs));
+  try{
+    while(Date.now()<deadline){
+      if(fs.existsSync(responseFile)){
+        const response=JSON.parse(fs.readFileSync(responseFile,"utf8"));
+        if(!response.ok)throw new Error(response.error||"Chrome 连接器钉钉中继请求失败");
+        return JSON.parse(response.bodyText||"{}");
+      }
+      if(Date.now()>=claimDeadline&&!fs.existsSync(claimedFile))throw new Error("Chrome 连接器钉钉中继未接管请求，请重新加载连接器后重试。");
+      await wait(250);
+    }
+    throw new Error("Chrome 连接器钉钉中继请求超时，请确认连接器已重新加载并保持启用。");
+  }finally{
+    for(const file of [requestFile,responseFile,claimedFile,temporary])try{fs.rmSync(file,{force:true})}catch{}
+  }
+}
+
+async function mcpCall(name,args,timeoutMs=180000){const {url,token}=credentials(),attempts=4,directTimeoutMs=Math.min(timeoutMs,15000);for(let attempt=1;attempt<=attempts;attempt++){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),directTimeoutMs);try{const headers={"content-type":"application/json","accept":"application/json"};if(token)headers.authorization=`Bearer ${token}`;const response=await fetch(url,{method:"POST",headers,body:JSON.stringify({jsonrpc:"2.0",method:"tools/call",params:{name,arguments:args},id:1}),signal:controller.signal});if(!response.ok){const error=new Error(`DINGTALK_MCP_HTTP_${response.status}`);error.transient=response.status===408||response.status===429||response.status>=500;throw error;}const envelope=await response.json();if(envelope.error)throw new Error(`DINGTALK_MCP_ERROR:${JSON.stringify(envelope.error)}`);const text=envelope.result?.content?.find(item=>item.type==="text")?.text,result=text?JSON.parse(text):envelope.result;if(result?.success===false)throw new Error(`DINGTALK_TOOL_ERROR:${result.errorMsg||JSON.stringify(result)}`);return result;}catch(error){const transient=error?.transient||error?.name==="AbortError"||error instanceof TypeError||["EACCES","ECONNRESET","ECONNREFUSED","ETIMEDOUT","ENOTFOUND","EAI_AGAIN","UND_ERR_CONNECT_TIMEOUT","UND_ERR_SOCKET"].includes(error?.cause?.code);if(!transient)throw error;if(attempt===1){try{return decodeMcpResult(await mcpCallViaBrowserRelay(JSON.stringify({jsonrpc:"2.0",method:"tools/call",params:{name,arguments:args},id:1}),timeoutMs))}catch(relayError){if(attempt===attempts)throw networkError(relayError,url,name,attempts);}}if(attempt===attempts)throw networkError(error,url,name,attempts);await wait([700,1600,3200][attempt-1]||3200);}finally{clearTimeout(timer);}}}
+function decodeMcpResult(envelope){
+  if(envelope.error)throw new Error(`DINGTALK_MCP_ERROR:${JSON.stringify(envelope.error)}`);
+  const text=envelope.result?.content?.find(item=>item.type==="text")?.text;
+  const result=text?JSON.parse(text):envelope.result;
+  if(envelope.result?.isError||result?.success===false)throw new Error(`DINGTALK_TOOL_ERROR:${result?.errorMsg||text||JSON.stringify(result)}`);
+  return result;
+}
+function pickColumn(headers,names){return headers.find(header=>names.some(name=>normalize(header).includes(name)))||"";}
+function percentage(value){const text=normalize(value);if(!text)return null;const number=Number(text.replace("%",""));if(!Number.isFinite(number))return null;return text.includes("%")?number:(Math.abs(number)<=1?number*100:number);}
+function average(values){const valid=values.filter(value=>value!=null&&Number.isFinite(value));return valid.length?valid.reduce((sum,value)=>sum+value,0)/valid.length:null;}
+function rate(value){return value==null?"—":`${value.toFixed(2)}%`;}
+function delta(value,baseline){return value==null||baseline==null?"—":`${value-baseline>=0?"+":""}${(value-baseline).toFixed(2)}%`;}
+function composite(row){const values=[row.im,row.wecom].filter(value=>value!=null&&Number.isFinite(value));return values.length?average(values):null;}
+function teacherStatus(row,imAverage,wecomAverage){if(row.im==null||row.wecom==null)return "数据待补充";const imGood=row.im>=imAverage,wecomGood=row.wecom>=wecomAverage;if(imGood&&wecomGood)return "双项领先";if(!imGood&&!wecomGood)return "双项待提升";return imGood?"企微待提升":"IM待提升";}
+const colorMatrix=(rows,cols,color)=>Array.from({length:rows},()=>Array(cols).fill(color));
+const serviceNumber=value=>value!==null&&value!==undefined&&value!==""&&Number.isFinite(Number(value))?Number(value):null;
+function serviceCallMetrics(source){
+  const voiceDial=serviceNumber(source.voiceDialCount);
+  const videoDial=serviceNumber(source.videoDialCount);
+  const videoConnected=serviceNumber(source.videoConnectedCount);
+  const voiceConnected=serviceNumber(source.voiceConnectedCount);
+  const dialTotal=voiceDial==null&&videoDial==null?null:(voiceDial??0)+(videoDial??0);
+  const connectedTotal=voiceConnected==null&&videoConnected==null?null:(voiceConnected??0)+(videoConnected??0);
+  return {voiceDial,videoDial,voiceConnected,videoConnected,dialTotal,connectedTotal,connectRate:dialTotal?connectedTotal/dialTotal*100:null,voiceConnectRate:voiceDial&&voiceConnected!=null?voiceConnected/voiceDial*100:serviceNumber(source.voiceConnectRate),videoConnectRate:videoDial&&videoConnected!=null?videoConnected/videoDial*100:serviceNumber(source.videoConnectRate)};
+}
+function serviceCallFields(item){
+  const calls=serviceCallMetrics(item);
+  return {callMetricsVersion:2,callUsers:item.callUsers,callCoverage:item.callCoverage,callDialCount:calls.dialTotal,callConnectedCount:calls.connectedTotal,callConnectRate:calls.connectRate,voiceCallUsers:serviceNumber(item.voiceCallUsers),voiceDialCount:calls.voiceDial,voiceConnectedCount:calls.voiceConnected,voiceCallRate:item.voiceCallRate,voiceConnectRate:calls.voiceConnectRate,voiceUsageRate:item.voiceUsageRate,videoCallUsers:serviceNumber(item.videoCallUsers),videoCallCoverage:item.videoCallCoverage,videoDialCount:calls.videoDial,videoConnectedCount:calls.videoConnected,videoCallRate:item.videoCallRate,videoConnectRate:calls.videoConnectRate,videoUsageRate:item.videoUsageRate,videoAverageMinutes:item.videoAverageMinutes};
+}
+
+function summarize(table,metricNames,dimension){
+  if(table.availability==="pending"&&(table.callValidation?.status==="empty-confirmed"||(dimension==="group"&&table.emptyValidation?.status==="empty-confirmed"))&&Array.isArray(table.rows)&&table.rows.length===0)return [];
+  const headers=table.headers||[],rows=table.rows||[];
+  const nameColumn=pickColumn(headers,dimension==="teacher"?["老师姓名","beisen_user_fullname","teacher_name","老师"]:["小组","level_7_department_name"]),idColumn=pickColumn(headers,["老师工号","worker_no","工号"]),groupColumn=pickColumn(headers,["小组","level_7_department_name"]),metricColumn=pickColumn(headers,metricNames),answeredColumn=pickColumn(headers,["im_answered_3m_count","wecom_answered_2h_count","三分钟消息回复数","三分钟内回答人数","3分钟内回答人数","两小时内回答人数","2小时内回答人数","回答人数"]),questionColumn=pickColumn(headers,["im_question_count","wecom_question_count","学生消息数","提问人数"]),imUserColumn=pickColumn(headers,["im_user_count","发送信息学员人数"]),imEligibleColumn=pickColumn(headers,["im_eligible_student_count","有IM且到课学员量"]),imUsageColumn=pickColumn(headers,["im_usage_rate","学生IM使用率"]);
+  if(!nameColumn||!metricColumn)throw new Error(`CRM_SERVICE_COLUMNS_MISSING:${dimension}:${metricNames.join("|")}`);
+  const groups=new Map();
+  const extras={callUsers:"callUsers",callCoverage:"callCoverage",voiceCallUsers:"voiceCallUsers",voiceDialCount:"voiceDialCount",voiceConnectedCount:"voiceConnectedCount",voiceCallRate:"voiceCallRate",voiceConnectRate:"voiceConnectRate",voiceUsageRate:"voiceUsageRate",videoCallUsers:"videoCallUsers",videoCallCoverage:"videoCallCoverage",videoDialCount:"videoDialCount",videoConnectedCount:"videoConnectedCount",videoCallRate:"videoCallRate",videoConnectRate:"videoConnectRate",videoUsageRate:"videoUsageRate",videoAverageMinutes:"videoAverageMinutes"};
+  for(const row of rows){const name=normalize(row[nameColumn]);if(!name||name==="显示总计")continue;const id=dimension==="teacher"?normalize(row[idColumn]):"",group=normalize(row[groupColumn]);const key=dimension==="teacher"?(id||name):name;if(!groups.has(key))groups.set(key,{id,name,group,values:[],answered:0,questions:0,hasCounts:false,imUsers:0,imEligible:0,hasUsageCounts:false,imUsageValues:[],extraValues:{}});const item=groups.get(key),answered=Number(row[answeredColumn]),questions=Number(row[questionColumn]),imUsers=Number(row[imUserColumn]),imEligible=Number(row[imEligibleColumn]);item.values.push(percentage(row[metricColumn]));if(answeredColumn&&questionColumn&&row[answeredColumn]!=null&&row[questionColumn]!=null&&Number.isFinite(answered)&&Number.isFinite(questions)){item.answered+=answered;item.questions+=questions;item.hasCounts=true;}if(imUserColumn&&imEligibleColumn&&row[imUserColumn]!=null&&row[imEligibleColumn]!=null&&Number.isFinite(imUsers)&&Number.isFinite(imEligible)){item.imUsers+=imUsers;item.imEligible+=imEligible;item.hasUsageCounts=true;}if(imUsageColumn)item.imUsageValues.push(percentage(row[imUsageColumn]));for(const [field,column] of Object.entries(extras)){if(!headers.includes(column)||row[column]==null)continue;const value=Number(row[column]);if(Number.isFinite(value))(item.extraValues[field]??=[]).push(value);}}
+  return [...groups.values()].map(item=>{const result={...item,value:item.hasCounts&&item.questions&&!table.countsDerived?item.answered/item.questions*100:average(item.values),answered:item.hasCounts?item.answered:null,questions:item.hasCounts?item.questions:null,imUsers:item.hasUsageCounts?item.imUsers:null,imEligible:item.hasUsageCounts?item.imEligible:null,imUsage:item.hasUsageCounts&&item.imEligible?item.imUsers/item.imEligible*100:average(item.imUsageValues),samples:item.values.filter(x=>x!=null).length};for(const [field,values] of Object.entries(item.extraValues))result[field]=field.endsWith("Count")||field.endsWith("Users")?values.reduce((sum,value)=>sum+value,0):average(values);delete result.values;delete result.imUsageValues;delete result.extraValues;return result;}).sort((a,b)=>a.name.localeCompare(b.name,"zh-CN"));
+}
+
+function buildServiceViews(serviceSource){
+  if(!serviceSource)return {teachers:[],groups:[]};
+  if(Array.isArray(serviceSource.teachers)&&Array.isArray(serviceSource.groups))return {teachers:serviceSource.teachers.filter(item=>item.老师!=="薛超"),groups:serviceSource.groups};
+  const imTeachers=serviceSource.im?.teacher?summarize(serviceSource.im.teacher,["3分钟回复率","pre_teacher_3m_reply_cnt"],"teacher").filter(item=>item.name!=="薛超"):[];
+  const wecomTeachers=serviceSource.wecom?.teacher?summarize(serviceSource.wecom.teacher,["2小时回复率","2h回复率","avg_2hour_reply_rate"],"teacher").filter(item=>item.name!=="薛超"):[];
+  const imGroups=serviceSource.im?.group?summarize(serviceSource.im.group,["3分钟回复率","pre_teacher_3m_reply_cnt"],"group"):[];
+  const wecomGroups=serviceSource.wecom?.group?summarize(serviceSource.wecom.group,["2小时回复率","2h回复率","avg_2hour_reply_rate"],"group"):[];
+  const teacherMap=new Map();
+  for(const item of imTeachers)teacherMap.set(item.id||item.name,{工号:item.id,老师:item.name,小组:item.group,im:item.value,imAnswered:item.answered,imQuestions:item.questions,imUsers:item.imUsers,imEligibleStudents:item.imEligible,imUsage:item.imUsage,...serviceCallFields(item),wecom:null});
+  for(const item of wecomTeachers){const key=item.id||item.name,old=teacherMap.get(key)||{工号:item.id,老师:item.name,小组:item.group,im:null,imAnswered:null,imQuestions:null};old.wecom=item.value;old.wecomAnswered=item.answered;old.wecomQuestions=item.questions;teacherMap.set(key,old);}
+  const groupMap=new Map();
+  for(const item of imGroups)groupMap.set(item.name,{小组:item.name,im:item.value,imAnswered:item.answered,imQuestions:item.questions,imUsers:item.imUsers,imEligibleStudents:item.imEligible,imUsage:item.imUsage,...serviceCallFields(item),wecom:null});
+  for(const item of wecomGroups){const old=groupMap.get(item.name)||{小组:item.name,im:null,imAnswered:null,imQuestions:null};old.wecom=item.value;old.wecomAnswered=item.answered;old.wecomQuestions=item.questions;groupMap.set(item.name,old);}
+  return {teachers:[...teacherMap.values()],groups:[...groupMap.values()]};
+}
+
+function validateServiceSummaryTables(source){
+  if(Object.keys(source.today?.errors||{}).some(key=>key.startsWith("im.")))throw new Error(`CRM_SERVICE_TODAY_IM_INCOMPLETE:${JSON.stringify(source.today.errors)}`);
+  for(const [scope,table] of [["多日老师",source.im?.teacher],["多日小组",source.im?.group],["今日老师",source.today?.im?.teacher],["今日小组",source.today?.im?.group]]){
+    if(!table)continue;
+    const rows=Array.isArray(table.rows)?table.rows:[],headers=Array.isArray(table.headers)?table.headers:[],isDetailName=normalize(table.chartName).includes("明细"),isSafelyAggregated=table.granular===false&&table.aggregation==="summary-chart";
+    if(table.granular===true||(isDetailName&&!isSafelyAggregated))throw new Error(`CRM_SERVICE_SUMMARY_REQUIRED:${scope}:${table.chartName||"未知图表"}`);
+    if(rows.length&&!headers.includes("im_question_count"))throw new Error(`CRM_SERVICE_SUMMARY_COUNTS_MISSING:${scope}:${table.chartName||"未知图表"}`);
+    for(const row of rows){const answered=Number(row.im_answered_3m_count),questions=Number(row.im_question_count);if(row.im_answered_3m_count!=null&&row.im_question_count!=null&&(!Number.isFinite(answered)||!Number.isFinite(questions)||answered<0||questions<0||answered>questions))throw new Error(`CRM_SERVICE_SUMMARY_COUNTS_INVALID:${scope}:${table.chartName||"未知图表"}`);}
+  }
+}
+
+function activeStudentCounts(){
+  try{const source=JSON.parse(fs.readFileSync(TEACHING_TABLES,"utf8")),table=source.sheets?.["组内概览"]||{},columns=table.columns||[],teacherIndex=columns.indexOf("老师"),activeIndex=["直播应到次数","第一节课应到次数","偶数课应完课次数"].map(name=>columns.indexOf(name)).find(index=>index>=0);if(teacherIndex<0||activeIndex==null||activeIndex<0)return new Map();return new Map((table.data||[]).map(row=>[normalize(row[teacherIndex]),Number(row[activeIndex])]).filter(([,count])=>Number.isFinite(count)&&count>=0));}catch{return new Map();}
+}
+
+async function writeSheet(matrix,layout){const listing=await mcpCall("get_all_sheets",{nodeId:WORKBOOK}),sheets=Array.isArray(listing)?listing:(listing?.sheets||[]);let sheet=sheets.find(item=>normalize(item.name)===SHEET_NAME);if(!sheet){const created=await mcpCall("create_sheet",{nodeId:WORKBOOK,name:SHEET_NAME});sheet={sheetId:created.sheetId||SHEET_NAME,name:SHEET_NAME};}const sheetId=sheet.sheetId||sheet.name;await mcpCall("clear_range",{nodeId:WORKBOOK,sheetId,range:"A:Z",type:"all"});for(let start=0;start<matrix.length;start+=300){const chunk=matrix.slice(start,start+300);await mcpCall("set_range_from_csv",{nodeId:WORKBOOK,sheetId,startCell:`A${start+1}`,csv:matrixToCsv(chunk),allowOverwrite:true});}
+  const style=async(rangeAddress,options)=>mcpCall("update_range",{nodeId:WORKBOOK,sheetId,rangeAddress,...options});
+  await mcpCall("update_sheet",{nodeId:WORKBOOK,sheetId,frozenRowCount:layout.teacherHeader,frozenColumnCount:3});
+  await mcpCall("set_gridline_visibility",{nodeId:WORKBOOK,sheetId,visibility:"hidden"});
+  await style("A1:J1",{backgroundColors:colorMatrix(1,10,"#173F5F"),fontColors:colorMatrix(1,10,"#FFFFFF"),fontWeights:colorMatrix(1,10,"bold"),fontSizes:colorMatrix(1,10,14),verticalAlignments:colorMatrix(1,10,"middle")});
+  await style("A2:J2",{backgroundColors:colorMatrix(1,10,"#EAF3F8"),fontColors:colorMatrix(1,10,"#456879"),fontWeights:colorMatrix(1,10,"bold")});
+  await style("A4:J4",{backgroundColors:colorMatrix(1,10,"#DDEBF3"),fontColors:colorMatrix(1,10,"#173F5F"),fontWeights:colorMatrix(1,10,"bold"),horizontalAlignments:colorMatrix(1,10,"center")});
+  await style("A5:J5",{backgroundColors:colorMatrix(1,10,"#F5FAFC"),fontColors:colorMatrix(1,10,"#173F5F"),fontWeights:colorMatrix(1,10,"bold"),fontSizes:colorMatrix(1,10,13),horizontalAlignments:colorMatrix(1,10,"center")});
+  for(const row of [layout.teacherSection,layout.groupSection])await style(`A${row}:J${row}`,{backgroundColors:colorMatrix(1,10,"#1F4E78"),fontColors:colorMatrix(1,10,"#FFFFFF"),fontWeights:colorMatrix(1,10,"bold"),fontSizes:colorMatrix(1,10,12)});
+  for(const row of [layout.teacherHeader,layout.groupHeader])await style(`A${row}:J${row}`,{backgroundColors:colorMatrix(1,10,"#6EA8C7"),fontColors:colorMatrix(1,10,"#FFFFFF"),fontWeights:colorMatrix(1,10,"bold"),horizontalAlignments:colorMatrix(1,10,"center"),verticalAlignments:colorMatrix(1,10,"middle"),wordWrap:"autoWrap"});
+  if(layout.teacherEnd>=layout.teacherStart){const count=layout.teacherEnd-layout.teacherStart+1;await style(`A${layout.teacherStart}:J${layout.teacherEnd}`,{backgroundColors:Array.from({length:count},(_,i)=>Array(10).fill(i%2?"#F7FAFB":"#FFFFFF")),verticalAlignments:colorMatrix(count,10,"middle")});await style(`E${layout.teacherStart}:I${layout.teacherEnd}`,{numberFormat:"0.00%",horizontalAlignments:colorMatrix(count,5,"center")});await style(`J${layout.teacherStart}:J${layout.teacherEnd}`,{backgroundColors:layout.teacherStatuses.map(status=>[status==="双项领先"?"#DFF3E8":status==="双项待提升"?"#FADBD8":status==="数据待补充"?"#ECEFF1":"#FFF1C7"]),fontColors:layout.teacherStatuses.map(status=>[status==="双项领先"?"#116F5E":status==="双项待提升"?"#A3322E":"#8A5A00"]),fontWeights:colorMatrix(count,1,"bold"),horizontalAlignments:colorMatrix(count,1,"center")});}
+  if(layout.groupEnd>=layout.groupStart){const count=layout.groupEnd-layout.groupStart+1;await style(`A${layout.groupStart}:G${layout.groupEnd}`,{backgroundColors:Array.from({length:count},(_,i)=>Array(7).fill(i%2?"#F7FAFB":"#FFFFFF")),verticalAlignments:colorMatrix(count,7,"middle")});await style(`C${layout.groupStart}:G${layout.groupEnd}`,{numberFormat:"0.00%",horizontalAlignments:colorMatrix(count,5,"center")});}
+  for(const [start,length,size] of [["A",1,58],["B",1,105],["C",1,105],["D",1,90],["E",5,125],["J",1,115]])await mcpCall("update_dimension",{nodeId:WORKBOOK,sheetId,dimension:"COLUMNS",startIndex:start,length,pixelSize:size});
+  for(const [start,length,size] of [["1",1,38],["4",2,32],[String(layout.teacherSection),1,34],[String(layout.teacherHeader),1,42],[String(layout.groupSection),1,34],[String(layout.groupHeader),1,42]])await mcpCall("update_dimension",{nodeId:WORKBOOK,sheetId,dimension:"ROWS",startIndex:start,length,pixelSize:size});
+  const verify=await mcpCall("get_range",{nodeId:WORKBOOK,sheetId,range:`A1:J${Math.min(matrix.length,10)}`});if(!JSON.stringify(verify).includes("教学服务数据")||!JSON.stringify(verify).includes("较组均值"))throw new Error("VERIFY_SERVICE_SHEET_FAILED");return sheetId;}
+
+async function main(){const input=process.argv[2],output=process.argv[3];if(!input||!fs.existsSync(input))throw new Error("CRM_SERVICE_INPUT_NOT_FOUND");const source=JSON.parse(fs.readFileSync(input,"utf8").replace(/^\uFEFF/,"")),dates=source.dates||[],requested=source.serviceSelection||{},requestedDates=Array.isArray(requested.dates)?[...new Set(requested.dates.map(value=>String(value||"").trim()).filter(value=>/^\d{4}-\d{2}-\d{2}$/.test(value)))].sort():[],serviceSelection={days:Array.isArray(requested.days)&&requested.days.length?requested.days.map(Number):[5,6,0],dates:requestedDates,dateSource:requestedDates.length?String(requested.dateSource||"explicitDates"):"weekdaySelection",openedWeek:String(requested.openedWeek||""),startHour:Number.isInteger(Number(requested.startHour))?Number(requested.startHour):14,endHour:Number.isInteger(Number(requested.endHour))?Number(requested.endHour):21},serviceTimeLabel=`${String(serviceSelection.startHour).padStart(2,"0")}:00–${String(serviceSelection.endHour).padStart(2,"0")}:00`;
+  validateServiceSummaryTables(source);
+  const debugTable=table=>({chart:table?.chartName,headers:table?.headers,granular:table?.granular,countsDerived:Boolean(table?.countsDerived),resolvedColumns:table?.resolvedColumns||{},availableColumns:table?.availableColumns||[],candidateAttempts:table?.candidateAttempts||[],callDiagnostics:table?.callDiagnostics||null,callValidation:table?.callValidation||null,detailCallDiagnostics:table?.detailCallDiagnostics||null});
+  const debugFile=output.replace(/service-data\.json$/,"service-debug.json");fs.writeFileSync(debugFile,JSON.stringify({dates,serviceSelection,todayDates:source.today?.dates||[],todayErrors:source.today?.errors||{},todayError:source.today?.error||null,imTeacher:debugTable(source.im?.teacher),imGroup:debugTable(source.im?.group),wecomTeacher:debugTable(source.wecom?.teacher),wecomGroup:debugTable(source.wecom?.group),todayImTeacher:debugTable(source.today?.im?.teacher),todayWecomTeacher:debugTable(source.today?.wecom?.teacher)},null,2),"utf8");
+  const aggregate=buildServiceViews(source),teachers=aggregate.teachers,groups=aggregate.groups,activeByTeacher=activeStudentCounts();for(const teacher of teachers)teacher.activeStudents=activeByTeacher.get(normalize(teacher.老师))??null;
+  const daily=buildServiceViews(source.today),dailyDate=source.today?.dates?.[0]||"";for(const teacher of daily.teachers)teacher.activeStudents=activeByTeacher.get(normalize(teacher.老师))??null;
+  const teacherImAverage=average(teachers.map(x=>x.im)),teacherWecomAverage=average(teachers.map(x=>x.wecom)),groupImAverage=average(groups.map(x=>x.im)),groupWecomAverage=average(groups.map(x=>x.wecom));teachers.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.老师.localeCompare(b.老师,"zh-CN"));groups.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.小组.localeCompare(b.小组,"zh-CN"));daily.teachers.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.老师.localeCompare(b.老师,"zh-CN"));daily.groups.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.小组.localeCompare(b.小组,"zh-CN"));const statuses=teachers.map(x=>teacherStatus(x,teacherImAverage,teacherWecomAverage)),leading=statuses.filter(x=>x==="双项领先").length;
+  const updatedAt=Array.isArray(source.teachers)&&source.updatedAt?String(source.updatedAt):new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai",hour12:false}),period=dates.join("、"),teacherSection=7,teacherHeader=8,teacherStart=9,teacherEnd=teacherStart+teachers.length-1,groupSection=teacherEnd+2,groupHeader=groupSection+1,groupStart=groupHeader+1,groupEnd=groupStart+groups.length-1;const matrix=[["教学服务数据对比看板",`数据更新时间：${updatedAt}`],["统计日期",period,"统计时段",serviceTimeLabel,"说明","空值不计入均值"],[],["老师人数","IM 3分钟平均","企微2小时平均","双项领先人数","IM最高","企微最高"],[teachers.length,rate(teacherImAverage),rate(teacherWecomAverage),leading,rate(Math.max(...teachers.map(x=>x.im).filter(Number.isFinite))),rate(Math.max(...teachers.map(x=>x.wecom).filter(Number.isFinite)))],[],["屹柯组老师对比 · 按双指标均值降序"],["排名","老师工号","老师姓名","小组","IM 3分钟回复率","较组均值","企微2小时回复率","较组均值","双指标均值","表现"],...teachers.map((x,index)=>[index+1,x.工号,x.老师,x.小组,rate(x.im),delta(x.im,teacherImAverage),rate(x.wecom),delta(x.wecom,teacherWecomAverage),rate(composite(x)),statuses[index]]),[],["AI C++教学部小组对比 · 按双指标均值降序"],["排名","小组","IM 3分钟回复率","较部门均值","企微2小时回复率","较部门均值","双指标均值"],...groups.map((x,index)=>[index+1,x.小组,rate(x.im),delta(x.im,groupImAverage),rate(x.wecom),delta(x.wecom,groupWecomAverage),rate(composite(x))])];
+  const layout={teacherSection,teacherHeader,teacherStart,teacherEnd,groupSection,groupHeader,groupStart,groupEnd,teacherStatuses:statuses},sheetId=await writeSheet(matrix,layout),dashboard={updatedAt,dates,serviceSelection,callValidation:source.im?.teacher?.callValidation||null,teachers,groups,today:{date:dailyDate,callValidation:source.today?.im?.teacher?.callValidation||null,teachers:daily.teachers,groups:daily.groups,status:source.today?.status||null,errors:source.today?.errors||{},error:source.today?.error||null},sheetId};fs.writeFileSync(output,JSON.stringify(dashboard,null,2),"utf8");console.log(`SERVICE_OK teachers=${teachers.length} groups=${groups.length} todayTeachers=${daily.teachers.length} sheet=${sheetId} updated=${updatedAt}`);
+}
+export {summarize,buildServiceViews,validateServiceSummaryTables,decodeMcpResult};
+if(process.argv[1]&&path.resolve(process.argv[1])===path.resolve(fileURLToPath(import.meta.url)))main().catch(error=>{console.error(String(error?.message||error));process.exitCode=1;});
