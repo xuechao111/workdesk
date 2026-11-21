@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference='Stop'
+$ErrorActionPreference='Stop'
 $base=Split-Path -Parent $PSScriptRoot
 foreach($file in @('bridge.ps1','start-workbench.ps1')) {
     $tokens=$null;$errors=$null

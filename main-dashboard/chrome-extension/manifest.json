@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "编程猫教学控制台连接器",
-  "version": "1.6.79",
+  "version": "1.6.82",
   "description": "主工作台8765专用；不访问副本8766。",
   "permissions": [
     "tabs",

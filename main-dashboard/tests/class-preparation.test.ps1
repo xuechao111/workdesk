@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference='Stop'
+$ErrorActionPreference='Stop'
 $sourceRoot=Split-Path -Parent $PSScriptRoot
 $fixtureRoot=Join-Path $sourceRoot ('run-data\class-preparation-test-'+[guid]::NewGuid().ToString('N'))
 $classPreparationJobs=@{}

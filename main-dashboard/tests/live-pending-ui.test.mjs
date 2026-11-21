@@ -25,3 +25,19 @@ test('verified zero live attendance remains a genuine zero, not pending',()=>{
 test('missing room and unverified fallback flags also suppress live rates and sorting',()=>{
  const {context}=runtime(false);for(const flag of ['missingLiveBoards','detailLiveFallbacks','livePending']){const row={current:{liveRate:.99,[flag]:1}};assert.equal(context.livePercent(row.current),'待更新');assert.equal(context.overviewSortValue(row,'liveRate'),null)}
 });
+
+test('teacher comparison ignores missing historical rooms outside opened current slots',()=>{
+ const {context,html}=runtime(false),row=context.analysisData.rows[0];
+ row.current={...row.current,liveExpected:139,liveAttend:106,liveRate:106/139};
+ row.previous={...row.previous,livePending:true,missingLiveBoards:1};
+ row.timelyLiveComparison={currentPending:false,previousPending:false,hasBaseline:true,previousExpected:139,previousAttend:108};
+ context.renderTeamBoard();
+ assert.match(html(),/77\.7%/);
+ assert.doesNotMatch(html(),/待更新/);
+ // An actual missing historical room in the matched scope must still block comparison.
+ row.timelyLiveComparison.previousPending=true;
+ row.timelyLiveComparison.hasBaseline=false;
+ context.renderTeamBoard();
+ assert.match(html(),/上周<\/small><b>待更新/);
+ assert.match(html(),/76\.3%/);
+});

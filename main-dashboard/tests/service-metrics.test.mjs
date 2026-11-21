@@ -64,10 +64,15 @@ assert.equal(separate.callConnectedCount,8);
 // Repeated calls to one learner must display completed calls, not unique learners.
 const page=fs.readFileSync(new URL('../index.html',import.meta.url),'utf8');
 const uiCalls=page.slice(page.indexOf('  function serviceCallMetrics(row)'),page.indexOf('  async function loadServiceCountMetricsV2'));
-const ui=vm.runInNewContext(`(()=>{${uiCalls};return {serviceCallSummary,serviceCallText,serviceCallCell}})()`,{serviceHasNumber:value=>value!=null&&value!==''&&Number.isFinite(Number(value)),serviceRate:value=>value==null?'—':`${value.toFixed(2)}%`});
+const ui=vm.runInNewContext(`(()=>{${uiCalls};return {serviceCallSummary,serviceCallText,serviceCallCell,serviceVideoCoverage,serviceVideoCoverageCell}})()`,{serviceHasNumber:value=>value!=null&&value!==''&&Number.isFinite(Number(value)),esc:value=>String(value),serviceRate:value=>value==null?'—':`${value.toFixed(2)}%`});
 const repeated={...separate,callMetricsVersion:2};
 assert.equal(ui.serviceCallText(ui.serviceCallSummary([repeated],'video')),'接通 2 次 / 拨打 3 次');
 assert.match(ui.serviceCallCell(repeated,'video'),/^接通 2 次 \/ 拨打 3 次/);
 assert.match(ui.serviceCallCell(repeated,'video'),/通话人数 1 人/);
+const coverageRow={videoCoverageUsers:32,videoCoverageTotal:219};
+assert.equal(ui.serviceVideoCoverage(coverageRow).rate,32/219*100);
+assert.match(ui.serviceVideoCoverageCell(coverageRow),/32 \/ 219 人/);
+assert.equal(ui.serviceVideoCoverage({videoCoverageUsers:0,videoCoverageTotal:0}).exact,false);
+assert.match(ui.serviceVideoCoverageCell({videoCallUsers:2}),/等待累计视频数据/);
 
 assert.throws(()=>validateServiceSummaryTables({...source,today:{errors:{'im.teacher':'CRM_SERVICE_CALL_RECONCILIATION_FAILED'}}}),/TODAY_IM_INCOMPLETE/);

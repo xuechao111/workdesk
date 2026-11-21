@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference='Stop'
+$ErrorActionPreference='Stop'
 $repair=Join-Path (Split-Path -Parent $PSScriptRoot) 'repair-replica-update.ps1'
 $fixture=Join-Path $PSScriptRoot ('repair-fixture-' + [Guid]::NewGuid().ToString('N'))
 $utf8=[Text.UTF8Encoding]::new($false)

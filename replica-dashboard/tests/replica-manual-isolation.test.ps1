@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference='Stop'
+$ErrorActionPreference='Stop'
 $source=[IO.File]::ReadAllText((Join-Path (Split-Path -Parent $PSScriptRoot) 'bridge.ps1'))
 $port=8766
 $root=$PSScriptRoot

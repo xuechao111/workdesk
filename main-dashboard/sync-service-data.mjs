@@ -115,6 +115,31 @@ function buildServiceViews(serviceSource){
   return {teachers:[...teacherMap.values()],groups:[...groupMap.values()]};
 }
 
+// A cumulative DISTINCT learner count cannot be added across dates/hours.
+// Accept only the dedicated whole-period teacher summary produced by the connector.
+function attachVideoCoverage(teachers, coverage){
+  const startDate=/^\d{4}-\d{2}-\d{2}$/.test(String(coverage?.startDate||""))?String(coverage.startDate):null;
+  const endDate=/^\d{4}-\d{2}-\d{2}$/.test(String(coverage?.endDate||""))?String(coverage.endDate):null;
+  const table=coverage?.im?.teacher;
+  const validSource=coverage?.status==="complete"&&startDate&&endDate&&startDate<=endDate&&table?.granular===false&&table?.aggregation==="summary-chart"&&Array.isArray(table.rows);
+  const headers=Array.isArray(table?.headers)?table.headers:[],workerColumn=pickColumn(headers,["worker_no","老师工号","工号"]),nameColumn=pickColumn(headers,["beisen_user_fullname","teacher_name","老师姓名","老师"]),usersColumn=pickColumn(headers,["videoCallUsers"]);
+  const byId=new Map(),byName=new Map();
+  const add=(map,key,row)=>{if(key)map.set(key,map.has(key)?null:row)};
+  if(validSource&&usersColumn)for(const row of table.rows){add(byId,normalize(row[workerColumn]),row);add(byName,normalize(row[nameColumn]),row)}
+  for(const teacher of teachers){
+    const id=normalize(teacher.工号),name=normalize(teacher.老师),namedRow=byName.get(name),row=id&&byId.has(id)?byId.get(id):namedRow&&(!id||!normalize(namedRow[workerColumn]))?namedRow:null;
+    const rowStart=row?.startDate??startDate,rowEnd=row?.endDate??endDate,validDates=/^\d{4}-\d{2}-\d{2}$/.test(String(rowStart||""))&&/^\d{4}-\d{2}-\d{2}$/.test(String(rowEnd||""))&&rowStart<=rowEnd;
+    const rawUsers=serviceNumber(row?.[usersColumn]),rawTotal=serviceNumber(row&&Object.hasOwn(row,"videoCoverageTotal")?row.videoCoverageTotal:teacher.activeStudents);
+    const users=validSource&&validDates&&rawUsers!=null&&Number.isInteger(rawUsers)&&rawUsers>=0?rawUsers:null,total=rawTotal!=null&&Number.isInteger(rawTotal)&&rawTotal>=0?rawTotal:null;
+    teacher.videoCoverageUsers=users;
+    teacher.videoCoverageTotal=total;
+    teacher.videoCoverageRate=users!=null&&total>0&&users<=total?users/total*100:null;
+    teacher.videoCoverageStartDate=validDates?rowStart:null;
+    teacher.videoCoverageEndDate=validDates?rowEnd:null;
+  }
+  return teachers;
+}
+
 function validateServiceSummaryTables(source){
   if(Object.keys(source.today?.errors||{}).some(key=>key.startsWith("im.")))throw new Error(`CRM_SERVICE_TODAY_IM_INCOMPLETE:${JSON.stringify(source.today.errors)}`);
   for(const [scope,table] of [["多日老师",source.im?.teacher],["多日小组",source.im?.group],["今日老师",source.today?.im?.teacher],["今日小组",source.today?.im?.group]]){
@@ -152,12 +177,13 @@ async function main(){const input=process.argv[2],output=process.argv[3];if(!inp
   const debugFile=output.replace(/service-data\.json$/,"service-debug.json");fs.writeFileSync(debugFile,JSON.stringify({dates,serviceSelection,todayDates:source.today?.dates||[],todayErrors:source.today?.errors||{},todayError:source.today?.error||null,imTeacher:debugTable(source.im?.teacher),imGroup:debugTable(source.im?.group),wecomTeacher:debugTable(source.wecom?.teacher),wecomGroup:debugTable(source.wecom?.group),todayImTeacher:debugTable(source.today?.im?.teacher),todayWecomTeacher:debugTable(source.today?.wecom?.teacher)},null,2),"utf8");
   const aggregate=buildServiceViews(source),teachers=aggregate.teachers,groups=aggregate.groups,activeByTeacher=activeStudentCounts();for(const teacher of teachers)teacher.activeStudents=activeByTeacher.get(normalize(teacher.老师))??null;
   const daily=buildServiceViews(source.today),dailyDate=source.today?.dates?.[0]||"";for(const teacher of daily.teachers)teacher.activeStudents=activeByTeacher.get(normalize(teacher.老师))??null;
+  attachVideoCoverage(teachers,source.videoCoverage);attachVideoCoverage(daily.teachers,source.videoCoverage);
   const teacherImAverage=average(teachers.map(x=>x.im)),teacherWecomAverage=average(teachers.map(x=>x.wecom)),groupImAverage=average(groups.map(x=>x.im)),groupWecomAverage=average(groups.map(x=>x.wecom));teachers.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.老师.localeCompare(b.老师,"zh-CN"));groups.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.小组.localeCompare(b.小组,"zh-CN"));daily.teachers.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.老师.localeCompare(b.老师,"zh-CN"));daily.groups.sort((a,b)=>(composite(b)??-Infinity)-(composite(a)??-Infinity)||a.小组.localeCompare(b.小组,"zh-CN"));
   const updatedAt=Array.isArray(source.teachers)&&source.updatedAt?String(source.updatedAt):new Date().toLocaleString("sv-SE",{timeZone:"Asia/Shanghai",hour12:false});
   // The DingTalk service sheet is retired. Keep the same validated source,
   // aggregates and daily metrics for the local workbench without any workbook
   // lookup, creation, write or formatting request.
-  const dashboard={updatedAt,dates,serviceSelection,outputMode:"local",callValidation:source.im?.teacher?.callValidation||null,teachers,groups,today:{date:dailyDate,callValidation:source.today?.im?.teacher?.callValidation||null,teachers:daily.teachers,groups:daily.groups,status:source.today?.status||null,errors:source.today?.errors||{},error:source.today?.error||null}};fs.writeFileSync(output,JSON.stringify(dashboard,null,2),"utf8");console.log(`SERVICE_OK teachers=${teachers.length} groups=${groups.length} todayTeachers=${daily.teachers.length} mode=local updated=${updatedAt}`);
+  const dashboard={updatedAt,dates,serviceSelection,videoCoverage:source.videoCoverage||null,outputMode:"local",callValidation:source.im?.teacher?.callValidation||null,teachers,groups,today:{date:dailyDate,callValidation:source.today?.im?.teacher?.callValidation||null,teachers:daily.teachers,groups:daily.groups,status:source.today?.status||null,errors:source.today?.errors||{},error:source.today?.error||null}};fs.writeFileSync(output,JSON.stringify(dashboard,null,2),"utf8");console.log(`SERVICE_OK teachers=${teachers.length} groups=${groups.length} todayTeachers=${daily.teachers.length} mode=local updated=${updatedAt}`);
 }
-export {summarize,buildServiceViews,validateServiceSummaryTables,decodeMcpResult};
+export {summarize,buildServiceViews,attachVideoCoverage,validateServiceSummaryTables,decodeMcpResult};
 if(process.argv[1]&&path.resolve(process.argv[1])===path.resolve(fileURLToPath(import.meta.url)))main().catch(error=>{console.error(String(error?.message||error));process.exitCode=1;});

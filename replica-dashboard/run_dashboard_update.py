@@ -13,6 +13,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import base64
+from collections import Counter
 from pathlib import Path
 
 from overview_total_table import SHEET_NAME as OVERVIEW_TOTAL_SHEET_NAME
@@ -596,7 +597,7 @@ def clear_stale_rows(sheet_id: str, width: int, start_row: int, end_row: int, re
 
 
 def verify_current_week_only(sheet_id: str, table: dict) -> None:
-    """Fail if a rolling sheet has stale periods or differs from this run's dynamic row count."""
+    """Verify each cohort's generated periods and identities, including mixed latest weeks."""
     width = len(table["columns"])
     end_col = col_letter(width - 1)
     expected = table.get("data", [])
@@ -613,12 +614,35 @@ def verify_current_week_only(sheet_id: str, table: dict) -> None:
             raise RuntimeError(f"{sheet_id} 校验读取失败：{result.get('errorMsg') or result}")
         rows.extend(find_rows(result) or [])
     populated = [row for row in rows[1:] if any(value not in (None, "") for value in row[:width])]
-    expected_period = str(expected[0][-1]) if expected else ""
-    periods = {str(row[width - 1]) for row in populated if len(row) >= width and row[width - 1] not in (None, "")}
-    if len(populated) != len(expected) or periods != ({expected_period} if expected_period else set()):
+    # Paused/completed cohorts legitimately retain their own latest populated
+    # week. The first row's week is not an authoritative period for other cohorts.
+    # Compare identity + all period columns as a multiset so a swapped week,
+    # duplicated learner or stale row still fails even with the same row count.
+    period_columns = [i for i, name in enumerate(table["columns"]) if "周期" in str(name)]
+    if not period_columns:
+        raise RuntimeError(f"{sheet_id} 周期校验缺少明确的周期列，已停止报告成功。")
+    identity_columns = [i for i, name in enumerate(table["columns"])
+                        if "id" in str(name).lower() or str(name) in
+                        {"老师姓名", "老师", "学生姓名", "学员姓名", "课期", "班型", "班级", "异常类型", "直播课节"}]
+    verification_columns = sorted(set(identity_columns + period_columns))
+
+    def cell(row, index):
+        value = row[index] if index < len(row) else ""
+        if value is None:
+            return ""
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value == int(value):
+            return str(int(value))
+        return str(value).strip()
+
+    def signatures(data, columns):
+        return Counter(tuple(cell(row, i) for i in columns) for row in data)
+
+    expected_periods = sorted(signatures(expected, period_columns))
+    actual_periods = sorted(signatures(populated, period_columns))
+    if len(populated) != len(expected) or signatures(populated, verification_columns) != signatures(expected, verification_columns):
         raise RuntimeError(
-            f"{sheet_id} 当周数据校验失败：应为 {len(expected)} 行、周期 {expected_period or '空'}；"
-            f"实际 {len(populated)} 行、周期 {sorted(periods)}"
+            f"{sheet_id} 本轮数据校验失败：应为 {len(expected)} 行、周期 {expected_periods or '空'}；"
+            f"实际 {len(populated)} 行、周期 {actual_periods}；老师/班级/学员与周期对应关系不一致。"
         )
     tail_ranges = []
     clear_start = expected_end_row + 1

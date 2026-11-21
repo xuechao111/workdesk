@@ -1,21 +1,33 @@
+# Local configuration and credentials
 dashboard-config.json
-dashboard-config.backup.json
 share-config.json
 *.local.json
 instances/
-run-data/
+console-test.json
+
+# CRM sessions and learner data
 crm-browser-profile/
-runtime/
-__pycache__/
-*.pyc
-*.log
-*.lock
-*-status.json
-status.json
+run-data/
 dashboard-snapshot.json
+extension-classes.json
 service-data.json
 service-debug.json
 console-response.json
-console-test.json
-*-report.txt
+*-status.json
+status.json
+self-update-status.json
+setup-report.txt
+bridge-request-errors.log
+
+# Runtime artifacts
+*.log
+*.lock
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# Locally packaged binaries
+runtime/
+*.exe
 *.zip

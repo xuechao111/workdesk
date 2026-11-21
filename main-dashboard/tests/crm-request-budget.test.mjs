@@ -6,8 +6,8 @@ import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../chrome-extension/background.js',import.meta.url),'utf8');
 const code=source.slice(source.indexOf('async function collectCrmData('),source.indexOf('async function fetchComparisonLiveRooms('));
 const epoch=Date.parse('2026-11-06T12:00:00+08:00');
-const lessons=[['2026-10-27',1],['2026-10-28',2],['2026-11-03',3],['2026-11-04',4]].map(([day,id])=>({course_id:id,course_number:id,course_name:`${id}-course`,unlock_time:Date.parse(`${day}T12:00:00+08:00`)/1000}));
-function harness(detail){
+const lessons=[['2026-10-27',1],['2026-10-27',2],['2026-11-03',3],['2026-11-03',4]].map(([day,id])=>({course_id:id,course_number:id,course_name:`${id}-course`,unlock_time:Date.parse(`${day}T12:00:00+08:00`)/1000}));
+function harness(detail,catalog=lessons){
   let elapsed=0;
   const requests=[],timers=[];
   class Clock extends Date {static now(){return epoch+elapsed;}}
@@ -17,7 +17,7 @@ function harness(detail){
     fetch:async(url,options)=>{
       requests.push(url);
       if(url.includes('getTermInfo'))return response({data:{teacherName:'Teacher',termId:2,classId:1}});
-      if(url.includes('/courses/all'))return response({data:lessons});
+      if(url.includes('/courses/all'))return response({data:catalog});
       if(url.includes('/course-detail'))return detail({url,body:JSON.parse(options.body),response,advance:ms=>{elapsed+=ms;}});
       if(url.includes('/living/boards'))return response({data:{items:[],total:0}});
       throw Error(`Unexpected request ${url}`);
@@ -62,6 +62,43 @@ test('all pages of both weekly pairs survive a transient retry unchanged',async(
 test('premature empty detail pages fail rather than publish partial data',async()=>{
   const h=harness(({url,response})=>response({items:new URL(url).searchParams.get('page')==='1'?[{user_id:1,course_id:1}]:[],total:103}));
   await assert.rejects(h.run(),/CRM_DETAIL_INCOMPLETE:1:2:1\/103/);
+});
+
+test('learner totals do not truncate expanded two-course rows at the first 100 learners',async()=>{
+  const calls=[];
+  const h=harness(({url,body,response})=>{
+    const page=Number(new URL(url).searchParams.get('page'));
+    calls.push([body.course_ids.join(','),page]);
+    const users=Array.from({length:page===1?100:10},(_,i)=>(page-1)*100+i+1);
+    return response({items:users.flatMap(user_id=>body.course_ids.map(course_id=>({user_id,course_id,is_open:true,is_finish:user_id>100}))),total:110});
+  });
+  const blocks=JSON.parse(await h.run());
+  assert.deepEqual(calls,[['1,2',1],['1,2',2],['3,4',1],['3,4',2]]);
+  for(const course_id of [1,2,3,4])assert.equal(blocks[0].items.filter(row=>row.course_id===course_id).length,110);
+  assert.equal(blocks[0].items.filter(row=>row.is_finish).length,40);
+});
+
+test('expanded rows cannot hide an empty or repeated final learner page',async()=>{
+  for(const repeated of [false,true]){
+    const h=harness(({url,body,response})=>{
+      const page=Number(new URL(url).searchParams.get('page'));
+      const users=page===1||repeated?Array.from({length:100},(_,i)=>i+1):[];
+      return response({items:users.flatMap(user_id=>body.course_ids.map(course_id=>({user_id,course_id}))),total:110});
+    });
+    await assert.rejects(h.run(),/CRM_DETAIL_INCOMPLETE:1:2:100\/110/);
+  }
+});
+
+test('a standalone inserted lesson never shifts requests across real weekly pairs',async()=>{
+  const inserted={course_id:99,course_number:3,course_name:'99-Inserted course',unlock_time:Date.parse('2026-11-01T12:00:00+08:00')/1000};
+  const calls=[];
+  const h=harness(({body,response})=>{
+    calls.push(body.course_ids);
+    return response({items:body.course_ids.map(course_id=>({user_id:1,course_id})),total:1});
+  },[...lessons.slice(0,2),inserted,...lessons.slice(2)]);
+  const blocks=JSON.parse(await h.run());
+  assert.deepEqual(calls,[[1,2],[99],[3,4]]);
+  assert.equal(blocks[0].items.length,5);
 });
 
 test('deadline exhaustion does not start another retry or accept a late response',async()=>{

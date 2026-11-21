@@ -607,6 +607,7 @@ async function fetchRenewalInCurrentChrome(renewalMonth){
     const results=await chrome.scripting.executeScript({
       target:{tabId:tab.id},world:"MAIN",args:[RENEWAL_COLUMN_NAMES,selectedMonth],
       func:async(columnNames,selectedMonth)=>{
+        try{
         if(!location.href.startsWith("https://bigdata-superset.codemao.cn/"))throw new Error("CRM_LOGIN_EXPIRED");
         const chartResponse=await fetch("/api/v1/chart/5014",{credentials:"include"});
         if(chartResponse.status===401||chartResponse.redirected)throw new Error("CRM_LOGIN_EXPIRED");
@@ -635,12 +636,25 @@ async function fetchRenewalInCurrentChrome(renewalMonth){
         let csrf="";
         try{const tokenResponse=await fetch("/api/v1/security/csrf_token/",{credentials:"include"});if(tokenResponse.ok)csrf=(await tokenResponse.json()).result||"";}catch{}
         const headers={"content-type":"application/json"};if(csrf)headers["x-csrftoken"]=csrf;
-        const response=await fetch("/api/v1/chart/data",{method:"POST",credentials:"include",headers,body:JSON.stringify(query)});
-        if(response.status===401||response.redirected)throw new Error("CRM_LOGIN_EXPIRED");
-        if(!response.ok)throw new Error(`CRM_DATA_HTTP_${response.status}`);
-        const payload=await response.json();
-        const raw=payload.result?.find(item=>Array.isArray(item.data))||payload.result?.[0];
-        if(!raw||!Array.isArray(raw.data))throw new Error("CRM_CHART_RESULT_INVALID");
+        let raw;
+        for(let attempt=0;attempt<2;attempt++){
+          const response=await fetch("/api/v1/chart/data",{method:"POST",credentials:"include",headers,body:JSON.stringify(query)});
+          if(response.status===401||response.redirected)throw new Error("CRM_LOGIN_EXPIRED");
+          if(response.status===403)throw new Error("CRM_RENEWAL_ACCESS_DENIED:当前CRM账号无权查询续费数据");
+          if(!response.ok)throw new Error(`CRM_DATA_HTTP_${response.status}`);
+          const payload=await response.json();
+          if(payload.error||payload.errors?.length)throw new Error("CRM_RENEWAL_QUERY_FAILED:CRM查询返回错误，未写入表格");
+          const results=payload.result;
+          if(!Array.isArray(results)||!results.length)throw new Error("CRM_CHART_RESULT_INVALID");
+          const failed=results.find(item=>item.error||item.status==="failed");
+          if(failed)throw new Error("CRM_RENEWAL_QUERY_FAILED:CRM查询执行失败，未写入表格");
+          const tables=results.filter(item=>Array.isArray(item.data));
+          if(tables.length!==1)throw new Error("CRM_RENEWAL_RESULT_AMBIGUOUS:续费明细返回多份或无效结果，未写入表格");
+          raw=tables[0];
+          if(raw.data.length)break;
+          if(Number(raw.rowcount||0)>0)throw new Error(`CRM_DATA_TRUNCATED:0/${raw.rowcount}`);
+        }
+        if(!raw.data.length)throw new Error(`CRM_RENEWAL_EMPTY:${selectedMonth} · 首续 · 深圳战区：CRM连续两次返回0条。请在同一CRM账号核对该月份及可见范围；原表未清空，不会自动改月份。`);
         const clean=value=>String(value??"").replace(/\s+/g," ").trim();
         const physical=(raw.colnames||Object.keys(raw.data[0]||{})).map(clean),verbose=raw.verbose_map||{};
         const display=physical.map(column=>clean(columnNames[column]||verbose[column]||column));
@@ -648,10 +662,12 @@ async function fetchRenewalInCurrentChrome(renewalMonth){
         const rowcount=Number(raw.rowcount??rows.length);
         if(rowcount>rows.length)throw new Error(`CRM_DATA_TRUNCATED:${rows.length}/${rowcount}`);
         return JSON.stringify({headers:display,rows,rowcount,renewalMonth:selectedMonth,renewalScope:{version:1,groupScope:"all",region:"深圳战区",node:"首续",month:selectedMonth}});
+        }catch(error){return {renewalError:String(error?.message||error)}}
       }
     });
     const data=results[0]?.result;
-    if(!data)return {ok:false,error:"当前谷歌浏览器中的CRM页面没有返回续费数据。"};
+    if(data?.renewalError)throw new Error(data.renewalError);
+    if(typeof data!=="string"||!data)return {ok:false,error:"续费CRM未返回有效明细，请重新加载副本连接器后刷新页面；原表未修改。"};
     return {ok:true,data,tabId:tab.id,renewalMonth:selectedMonth};
   }catch(error){
     const text=String(error?.message||error);
@@ -743,11 +759,23 @@ function serviceTodayDate(selection){
   return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-${String(now.getDate()).padStart(2,"0")}`;
 }
 
+function configuredServiceGroup(config={}){
+  const title=String(config.displayTitle||"").trim();
+  const group=title.split(/[·•|｜]/).map(value=>value.trim()).filter(Boolean).at(-1)||"";
+  if(!group.endsWith("组")||/[\r\n]/.test(group)||group.length>40)throw new Error("请在配置面板的工作台名称填写本组名称，例如：深圳战区 · 致远组");
+  return group;
+}
 async function fetchServiceInCurrentChrome(requestedSelection){
+  let groupName;
+  try {
+    const configResponse=await fetch(LOCAL_BASE+"/config",{cache:"no-store"});
+    if(!configResponse.ok)throw new Error("副本配置读取失败");
+    groupName=configuredServiceGroup(await configResponse.json());
+  }catch(error){return {ok:false,error:String(error?.message||error)}}
   const tabs=await chrome.tabs.query({url:"https://bigdata-superset.codemao.cn/*"});
   if(!tabs.length)return {ok:false,error:"请先在当前谷歌浏览器打开并登录 Superset CRM；控制台不会另开页面。"};
   const tab=tabs.find(x=>x.active&&!x.discarded)||tabs.find(x=>!x.discarded)||tabs[0];
-  const serviceSelection=normalizeServiceSelection(requestedSelection),dates=serviceSelectedDates(serviceSelection),todayDate=serviceTodayDate(serviceSelection);
+  const serviceSelection={...normalizeServiceSelection(requestedSelection),groupName},dates=serviceSelectedDates(serviceSelection),todayDate=serviceTodayDate(serviceSelection);
   try{
     await waitForTabReady(tab.id);
     const results=await Promise.race([chrome.scripting.executeScript({
@@ -776,7 +804,7 @@ async function fetchServiceInCurrentChrome(requestedSelection){
           const nativeFilters=metadata.native_filter_configuration||[];
           const filterColumn=keywords=>{const filter=nativeFilters.find(item=>keywords.some(word=>normalize(item.name).includes(word)));return filter?.targets?.[0]?.column?.name||filter?.target?.column?.name||"";};
           const columns={
-            date:filterColumn(["具体发送日期","具体统计日期"]),zone:filterColumn(["战区"]),team:filterColumn(["团队"]),group:filterColumn(["小组"]),department:filterColumn(["部门"]),timeType:filterColumn(["时间类型"]),hour:filterColumn(["小时","时间区间","发送时间"]),
+            date:filterColumn(["具体发送日期","具体统计日期"]),zone:filterColumn(["战区"]),team:filterColumn(["团队"]),group:filterColumn(["小组"])||"level_7_department_name",department:filterColumn(["部门"]),timeType:filterColumn(["时间类型"]),hour:filterColumn(["小时","时间区间","发送时间"]),
           };
           const charts=chartsPayload.result||chartsPayload.charts||chartsPayload||[];
           const pick=async dimension=>{
@@ -801,10 +829,12 @@ async function fetchServiceInCurrentChrome(requestedSelection){
             const add=(column,value)=>{if(column&&value!=null&&(!Array.isArray(value)||value.length))baseDesired.push({col:column,op:"IN",val:Array.isArray(value)?value:[value]});};
             add(dateColumn,filterDates);add(columns.zone,"AI C++教学部");
             if(kind==="wecom")add(columns.team,"深圳战区");else add(columns.department,["探月教学中心","深空教学中心"]);
-            if(dimension==="老师")add(columns.group,"屹柯组");
+            if(!serviceSelection.groupName)throw new Error("CRM_SERVICE_GROUP_MISSING");
+            if(dimension==="老师"&&!columns.group)throw new Error("CRM_SERVICE_GROUP_COLUMN_MISSING");
+            add(columns.group,serviceSelection.groupName);
             const serviceHours=serviceSelection.hours;
             const headers={"content-type":"application/json"};if(csrf)headers["x-csrftoken"]=csrf;
-            const execute=async extraFilters=>{const sortedDates=[...filterDates].sort(),end=new Date(`${sortedDates.at(-1)}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+1);const timeRange=`${sortedDates[0]}T00:00:00 : ${end.toISOString().slice(0,10)}T00:00:00`;const desired=[...baseDesired,...extraFilters],query=JSON.parse(JSON.stringify(queryTemplate)),targetColumns=new Set(desired.map(x=>x.col));for(const item of query.queries||[]){item.filters=(item.filters||[]).filter(filter=>!targetColumns.has(filter.col));item.filters.push(...desired);item.time_range=timeRange;item.row_limit=200000;item.row_offset=0;}query.force=true;query.form_data=query.form_data||{};query.form_data.time_range=timeRange;query.form_data.extra_form_data={...(query.form_data.extra_form_data||{}),filters:desired,time_range:timeRange};const payload=await api("/api/v1/chart/data",{method:"POST",headers,body:JSON.stringify(query)});return payload.result?.find(item=>Array.isArray(item.data))||payload.result?.[0];};
+            const execute=async extraFilters=>{const sortedDates=[...filterDates].sort(),end=new Date(`${sortedDates.at(-1)}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+1);const timeRange=`${sortedDates[0]}T00:00:00 : ${end.toISOString().slice(0,10)}T00:00:00`;const desired=[...baseDesired,...extraFilters],query=JSON.parse(JSON.stringify(queryTemplate)),targetColumns=new Set(desired.map(x=>x.col));for(const item of query.queries||[]){item.filters=(item.filters||[]).filter(filter=>!targetColumns.has(filter.col));item.filters.push(...desired);item.extras={...(item.extras||{}),where:"",having:""};delete item.adhoc_filters;item.time_range=timeRange;item.row_limit=200000;item.row_offset=0;}query.force=true;query.form_data=query.form_data||{};query.form_data.time_range=timeRange;query.form_data.extra_form_data={...(query.form_data.extra_form_data||{}),filters:desired,time_range:timeRange};const payload=await api("/api/v1/chart/data",{method:"POST",headers,body:JSON.stringify(query)});return payload.result?.find(item=>Array.isArray(item.data))||payload.result?.[0];};
             let raw;
             if(kind==="wecom"&&!columns.hour&&columns.timeType){
               const variants=[["工作时间"],["工作时段"],serviceHours,serviceHours.map(x=>`${x}时`),serviceHours.map(x=>`${x}点`),serviceHours.map(x=>`${x}:00`),serviceHours.map(x=>`${x}:00-${x}:59`),serviceHours.map(x=>Number(x))];
@@ -940,7 +970,7 @@ async function fetchServiceInCurrentChrome(requestedSelection){
           const errors={};for(const [kind,value] of [["im",todayIm],["wecom",todayWecom]])for(const [dimension,error] of Object.entries(value.errors))errors[`${kind}.${dimension}`]=error;
           today={dates:[todayDate],im:todayIm,wecom:todayWecom,errors,status:Object.keys(errors).length?"partial":"ok"};
         }
-        return JSON.stringify({dates,im,wecom,today,serviceSelection});
+        return JSON.stringify({dates,im,wecom,today,serviceSelection,groupName:serviceSelection.groupName});
       }catch(error){return JSON.stringify({__serviceError:String(error?.message||error)});}
       }
     }),new Promise((_,reject)=>setTimeout(()=>reject(new Error("CRM_SERVICE_TOTAL_TIMEOUT")),240000))]);

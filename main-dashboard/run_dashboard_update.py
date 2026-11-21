@@ -1330,6 +1330,50 @@ def write_sheet(name: str, table: dict, updated_at: str = "") -> int:
     return len(table.get("data", []))
 
 
+def build_and_validate_local():
+    """Build and validate every destination before any workbook mutation."""
+    from teaching_validation import preserve_generated_outputs
+    with preserve_generated_outputs(ROOT):
+        from comparison_live_cache import preserve
+        preserve(ROOT)
+        snapshot_build = subprocess.run(
+            [sys.executable, str(SOURCE_ROOT / "get_dashboard_snapshot.py")], cwd=ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace"
+        )
+        if snapshot_build.returncode:
+            lines = [line.strip() for line in snapshot_build.stdout.splitlines() if line.strip()]
+            message = lines[-1].removeprefix("RuntimeError: ") if lines else "教学看板完整性校验失败，已保留上一轮数据。"
+            raise RuntimeError(message)
+        subprocess.run([sys.executable, str(SOURCE_ROOT / "build_teaching_class_tables.py"), "--data-dir", str(DATA), "--classes", str(DATA / "classes.json"), "--raw-file", "group-lessons-raw.json"], cwd=ROOT, check=True)
+        dashboard = json.loads((DATA / "group-dashboard-tables.json").read_text(encoding="utf-8"))
+        subprocess.run([sys.executable, str(SOURCE_ROOT / "build_exception_exports.py")], cwd=ROOT, check=True)
+        export = json.loads((DATA / "exception-export-tables.json").read_text(encoding="utf-8"))
+
+        dingtalk_excluded = dingtalk_excluded_teachers()
+        generated_detail_teachers = detail_teacher_sets(export["tables"])
+        expected_detail_teachers = {
+            name: teachers - dingtalk_excluded
+            for name, teachers in generated_detail_teachers.items()
+        }
+        tables = dict(dashboard["sheets"])
+        tables.update(export["tables"])
+        snapshot = json.loads((ROOT / "dashboard-snapshot.json").read_text(encoding="utf-8"))
+        from teaching_validation import validate_teaching_outputs
+        raw = json.loads((DATA / "group-lessons-raw.json").read_text(encoding="utf-8"))
+        validate_teaching_outputs(raw, snapshot, dashboard, export)
+        from live_pending import apply_live_pending
+        apply_live_pending(tables, snapshot)
+        tables[OVERVIEW_TOTAL_SHEET_NAME] = build_overview_total_table(snapshot)
+        tables[WEEKLY_ATTENDANCE_SHEET_NAME] = build_weekly_attendance_table(snapshot, dingtalk_excluded)
+        # Stop syncing retired views while preserving existing workbook sheets.
+        for disabled_name in DISABLED_SHEETS:
+            tables.pop(disabled_name, None)
+        filter_dingtalk_excluded_rows(tables, dingtalk_excluded)
+        # Preserve every configured group teacher in all DingTalk detail sheets.
+        validate_detail_teacher_preservation(expected_detail_teachers, tables)
+        return tables
+
+
 def run(from_raw: bool = False) -> None:
     global RUN_STARTED_AT
     UPDATE_WARNINGS.clear()
@@ -1373,42 +1417,8 @@ def run(from_raw: bool = False) -> None:
         set_status("running", "已从当前Chrome获取CRM数据，正在生成看板…")
 
     compute_started = time.monotonic()
-    from comparison_live_cache import preserve
-    preserve(ROOT)
     set_status("running", "正在计算完课、直播上座和同期异常…")
-    subprocess.run([str(NODE), str(SKILL / "scripts" / "build_group_dashboard.mjs"), str(DATA), str(DATA / "classes.json"), "group-lessons-raw.json"], cwd=SKILL / "scripts", check=True)
-    dashboard = json.loads((DATA / "group-dashboard-tables.json").read_text(encoding="utf-8"))
-    snapshot_build = subprocess.run(
-        [sys.executable, str(SOURCE_ROOT / "get_dashboard_snapshot.py")], cwd=ROOT,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace"
-    )
-    if snapshot_build.returncode:
-        lines = [line.strip() for line in snapshot_build.stdout.splitlines() if line.strip()]
-        message = lines[-1].removeprefix("RuntimeError: ") if lines else "教学看板完整性校验失败，已保留上一轮数据。"
-        raise RuntimeError(message)
-    subprocess.run([sys.executable, str(SOURCE_ROOT / "build_exception_exports.py")], cwd=ROOT, check=True)
-    export = json.loads((DATA / "exception-export-tables.json").read_text(encoding="utf-8"))
-
-    dingtalk_excluded = dingtalk_excluded_teachers()
-    generated_detail_teachers = detail_teacher_sets(export["tables"])
-    expected_detail_teachers = {
-        name: teachers - dingtalk_excluded
-        for name, teachers in generated_detail_teachers.items()
-    }
-    tables = dict(dashboard["sheets"])
-    tables.update(export["tables"])
-    snapshot = json.loads((ROOT / "dashboard-snapshot.json").read_text(encoding="utf-8"))
-    from live_pending import apply_live_pending
-    apply_live_pending(tables, snapshot)
-    validate_abnormal_summary(export["tables"]["异常学员"], snapshot)
-    tables[OVERVIEW_TOTAL_SHEET_NAME] = build_overview_total_table(snapshot)
-    tables[WEEKLY_ATTENDANCE_SHEET_NAME] = build_weekly_attendance_table(snapshot, dingtalk_excluded)
-    # Stop syncing retired views while preserving existing workbook sheets.
-    for disabled_name in DISABLED_SHEETS:
-        tables.pop(disabled_name, None)
-    filter_dingtalk_excluded_rows(tables, dingtalk_excluded)
-    # Preserve every configured group teacher in all DingTalk detail sheets.
-    validate_detail_teacher_preservation(expected_detail_teachers, tables)
+    tables = build_and_validate_local()
     batch_updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
     compute_seconds = round(time.monotonic() - compute_started, 3)
     write_started = time.monotonic()

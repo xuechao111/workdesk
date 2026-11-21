@@ -70,7 +70,7 @@ function Assert-ReleasePath([string]$RelativePath) {
     if ($parts.Count -gt 1 -and $parts[0] -notin @('assets','chrome-extension','scripts','tests')) { throw "Release directory is not allowed: $RelativePath" }
     if ($RelativePath -match '(?i)(^|/)(dashboard-config\.json|share-config\.json|console-test\.json|REPLICA\.md|.*\.local\.json|.*-status\.json|status\.json|.*\.log|.*\.lock|.*\.csv|.*\.xlsx|.*\.zip|.*\.exe)$') { throw "Private or runtime file is not allowed: $RelativePath" }
     if ($parts.Count -eq 1) {
-        $allowed = $RelativePath -match '(?i)\.(ps1|py|mjs|html|vbs|bat|md)$' -or $RelativePath -in @('dashboard-config.example.json','dashboard-config.portable.example.json','dashboard-config.test.example.json','release-manifest.json','requirements.txt','.gitignore','使用说明.txt')
+        $allowed = $RelativePath -match '(?i)\.(ps1|py|mjs|html|vbs|bat|md)$' -or $RelativePath -in @('dashboard-config.example.json','dashboard-config.portable.example.json','dashboard-config.test.example.json','release-manifest.json','使用说明.txt')
     } elseif ($parts[0] -eq 'assets') {
         $allowed = $RelativePath -match '(?i)\.(png|jpg|jpeg|svg|webp|css|js|woff2?)$'
     } elseif ($parts[0] -eq 'chrome-extension') {
@@ -127,16 +127,6 @@ function Get-ValidatedRelease([string]$Root) {
         if (-not $seen.ContainsKey($required)) { throw "Required release file is missing: $required" }
     }
     return $manifest
-}
-
-function Resolve-DownloadedPackageRoot([string]$ArchiveRoot) {
-    # GitHub's ZIP wraps both independent packages in one repository directory.
-    # Never fall back to its root or the main-dashboard sibling.
-    $package = Resolve-ChildPath $ArchiveRoot 'replica-dashboard'
-    if (-not (Test-Path -LiteralPath $package -PathType Container)) {
-        throw 'The release archive does not contain replica-dashboard; nothing was installed.'
-    }
-    return $package
 }
 
 function Install-ValidatedRelease([string]$Root) {
@@ -211,7 +201,7 @@ try {
     }
     Write-UpdateStatus 'running' 'Checking the latest workbench release...' 'Configuration, credentials and runtime data are preserved.'
     if (-not $PackageRoot) {
-        $tempRoot=Join-Path ([IO.Path]::GetTempPath()) ('workdesk-replica-update-' + [Guid]::NewGuid().ToString('N'))
+        $tempRoot=Join-Path ([IO.Path]::GetTempPath()) ('wmzf-update-' + [Guid]::NewGuid().ToString('N'))
         $extractRoot=Join-Path $tempRoot 'extract'
         [void][IO.Directory]::CreateDirectory($extractRoot)
         $zipFile=Join-Path $tempRoot 'main.zip'
@@ -227,7 +217,7 @@ try {
         Expand-Archive -LiteralPath $zipFile -DestinationPath $extractRoot -Force
         $roots=@(Get-ChildItem -LiteralPath $extractRoot -Directory)
         if ($roots.Count -ne 1) { throw 'The release archive has an unexpected structure.' }
-        $PackageRoot=Resolve-DownloadedPackageRoot $roots[0].FullName
+        $PackageRoot=Join-Path $roots[0].FullName 'replica-dashboard'
     }
     $result=Install-ValidatedRelease ([IO.Path]::GetFullPath($PackageRoot))
     Write-UpdateStatus 'success' 'Workbench release installed.' ("Version $($result.version); $($result.count) source files verified. Local data preserved.")
@@ -246,6 +236,6 @@ try {
     if ($tempRoot) {
         $resolvedTemp=[IO.Path]::GetFullPath($tempRoot)
         $tempBase=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
-        if ($resolvedTemp.StartsWith($tempBase,[StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($resolvedTemp) -like 'workdesk-replica-update-*') { Remove-Item -LiteralPath $resolvedTemp -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($resolvedTemp.StartsWith($tempBase,[StringComparison]::OrdinalIgnoreCase) -and [IO.Path]::GetFileName($resolvedTemp) -like 'wmzf-update-*') { Remove-Item -LiteralPath $resolvedTemp -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import run_dashboard_update as core
 
+from teaching_metrics import METRICS_CONTRACT_VERSION, lesson_pairs, period_metrics
 from runtime_paths import runtime_root
 ROOT = runtime_root()
 OUT = ROOT / "dashboard-snapshot.json"
@@ -136,6 +137,10 @@ def public_metrics(metrics, roster, include_lists=True):
     live_pending = bool(metrics.get("missingLiveBoards") or metrics.get("detailLiveFallbacks"))
     result = {
         "livePending": live_pending,
+        "metricsContractVersion": METRICS_CONTRACT_VERSION,
+        "arrivalRosterSource": "course-detail",
+        "completionRosterSource": "course-detail",
+        "liveRosterSource": "pending-live-board" if live_pending else "verified-live-board",
         "arrivalExpected": metrics["arrivalExpected"], "arrivalAttend": metrics["arrivalAttend"],
         "arrivalRate": pct(metrics["arrivalAttend"], metrics["arrivalExpected"]),
         "liveExpected": metrics["liveExpected"], "liveAttend": metrics["liveAttend"],
@@ -294,93 +299,6 @@ def item_map(block, lesson_number):
     lesson = min(candidates, key=lambda item: (int(item.get("unlock_time") or 0), int(item.get("course_id") or 0)))
     cid = int(lesson["course_id"])
     return lesson, [x for x in block.get("items", []) if int(x.get("course_id") or 0) == cid]
-
-
-def lesson_pairs(block):
-    """Return real weekly first/second lesson pairs.
-
-    CRM course numbers can contain gaps after inserted lessons (for example
-    48/49 then 51/52), so odd/even arithmetic is not a stable pairing rule.
-    Lessons sharing the same unlock time are one weekly pair; a live-board key
-    identifies the first lesson when available.
-    """
-    groups = {}
-    for lesson in block.get("lessons", []):
-        number = int(lesson.get("course_number") or 0)
-        unlock = int(lesson.get("unlock_time") or 0)
-        name = str(lesson.get("course_name") or "")
-        if number <= 0 or unlock <= 0 or "赛考精讲" in name:
-            continue
-        groups.setdefault(unlock, []).append(lesson)
-    board_numbers = {int(key) for key in (block.get("liveAttendance") or {}) if str(key).isdigit()}
-    pairs = []
-    for unlock, lessons in sorted(groups.items()):
-        ordered = sorted(lessons, key=lambda item: (int(item.get("course_number") or 0), int(item.get("course_id") or 0)))
-        first = next((item for item in ordered if int(item.get("course_number") or 0) in board_numbers), None)
-        if first is not None:
-            later = [item for item in ordered if int(item.get("course_number") or 0) > int(first.get("course_number") or 0)]
-            second = later[0] if later else None
-        else:
-            first, second = (ordered[0], ordered[1]) if len(ordered) >= 2 else (None, None)
-        if first is not None and second is not None:
-            pairs.append((first, second))
-    return pairs
-
-
-def period_metrics(block, start, end, now, allow_detail_live=False):
-    result = {"arrivalExpected": 0, "arrivalAttend": 0, "liveExpected": 0, "liveAttend": 0, "replayAttend": 0, "evenExpected": 0, "evenDone": 0, "arrivedIncomplete": 0, "missingLiveBoards": 0, "detailLiveFallbacks": 0, "incompleteIds": set(), "arrivedIncompleteIds": set(), "liveExpectedIds": set(), "liveAttendIds": set(), "liveAbsentIds": set(), "replayIds": set(), "latestOpenedTime": 0}
-    for live_lesson, even_lesson in lesson_pairs(block):
-        live_number = int(live_lesson.get("course_number") or 0)
-        even_rows = [x for x in block.get("items", []) if int(x.get("course_id") or 0) == int(even_lesson.get("course_id") or 0)]
-        even_time = int(even_lesson.get("unlock_time") or 0)
-        pair_open = start <= even_time < end and even_time <= now
-        if pair_open:
-            first_rows = [x for x in block.get("items", []) if int(x.get("course_id") or 0) == int(live_lesson.get("course_id") or 0)]
-            first_arrived_ids = {str(x.get("user_id")) for x in first_rows if x.get("user_id") and bool(x.get("is_open"))}
-            finished_ids = {str(x.get("user_id")) for x in even_rows if x.get("user_id") and bool(x.get("is_finish"))}
-            pair_arrived_incomplete = first_arrived_ids - finished_ids
-            result["latestOpenedTime"] = max(result["latestOpenedTime"], even_time)
-            result["evenExpected"] += len(even_rows)
-            result["evenDone"] += sum(bool(x.get("is_finish")) for x in even_rows)
-            result["arrivedIncomplete"] += len(pair_arrived_incomplete)
-            result["incompleteIds"].update(str(x.get("user_id")) for x in even_rows if not bool(x.get("is_finish")))
-            result["arrivedIncompleteIds"].update(pair_arrived_incomplete)
-        live_rows = [x for x in block.get("items", []) if int(x.get("course_id") or 0) == int(live_lesson.get("course_id") or 0)]
-        live_time = int(live_lesson.get("unlock_time") or 0)
-        # A weekly pair belongs to the period of its real even-numbered lesson.
-        # This prevents an inserted/duplicate odd lesson from being counted as a
-        # second live class before its paired even lesson opens.
-        if pair_open and live_time <= now:
-            result["arrivalExpected"] += len(live_rows)
-            result["arrivalAttend"] += sum(bool(x.get("is_open")) for x in live_rows)
-            result["latestOpenedTime"] = max(result["latestOpenedTime"], live_time)
-            board = (block.get("liveAttendance") or {}).get(str(live_number)) or (block.get("liveAttendance") or {}).get(live_number)
-            if not board:
-                if not allow_detail_live:
-                    # Group members remain protected by the authoritative
-                    # live-board gate; an absent room can never become a zero.
-                    result["missingLiveBoards"] += 1
-                    continue
-                # Explicitly configured same-cohort comparison teachers may
-                # not be visible to this group's live-room API. In that case
-                # use CRM course-detail's live_course participation flag.
-                expected_ids = {str(x.get("user_id")) for x in live_rows if x.get("user_id")}
-                attended_ids = {str(x.get("user_id")) for x in live_rows if x.get("user_id") and bool(x.get("live_course"))}
-                absent_ids = expected_ids - attended_ids
-                result["detailLiveFallbacks"] += 1
-            else:
-                attended_ids = set(str(x) for x in (board or {}).get("attendedIds", []))
-                expected_ids = set(str(x) for x in (board or {}).get("expectedIds", []))
-                absent_ids = set(str(x) for x in (board or {}).get("absentIds", []))
-            result["liveExpected"] += len(expected_ids)
-            result["liveAttend"] += len(attended_ids)
-            result["liveExpectedIds"].update(expected_ids)
-            result["liveAttendIds"].update(attended_ids)
-            result["liveAbsentIds"].update(absent_ids)
-            replayed = lambda x: str(x.get("user_id")) not in attended_ids and (int(x.get("watch_time") or 0) > 0 or float(x.get("watch_process") or 0) > 0)
-            result["replayAttend"] += sum(replayed(x) for x in live_rows)
-            result["replayIds"].update(str(x.get("user_id")) for x in live_rows if replayed(x))
-    return result
 
 
 def merge_metrics(target, source):

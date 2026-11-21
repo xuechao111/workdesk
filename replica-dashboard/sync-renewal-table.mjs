@@ -33,6 +33,29 @@ function normalizeText(value) {
   return String(value ?? "").replace(/\s+/g," ").trim();
 }
 
+function normalizeSourceHeaders(source) {
+  if (!Array.isArray(source.headers) || !Array.isArray(source.rows)) throw new Error("CRM_INPUT_INVALID");
+  source.headers=source.headers.map(normalizeText);
+  const duplicates=source.headers.filter((header,index,headers)=>headers.indexOf(header)!==index);
+  if (!source.headers.length || source.headers.some(header=>!header) || duplicates.length) {
+    throw new Error(`CRM_HEADERS_INVALID:空表头或重复列:${[...new Set(duplicates)].join("|")}`);
+  }
+  // Source schemas can grow independently of the authorized workbook. The
+  // target's existing header names remain authoritative for writing columns.
+  return source;
+}
+
+function projectTargetRows(source,targetHeaders) {
+  const missing=targetHeaders.filter(header=>!source.headers.includes(header));
+  if (missing.length) {
+    const error=new Error(`CRM_MISSING_TARGET_COLUMNS:${missing.join("|")}`);
+    // Schema only: never include learner rows, document URLs or credentials.
+    error.schema={sourceHeaders:source.headers,targetHeaders,missingTargetHeaders:missing};
+    throw error;
+  }
+  return source.rows.map(row=>Object.fromEntries(targetHeaders.map(header=>[header,row[header] ?? ""])));
+}
+
 function normalizeWorkbookUrl(value) {
   const text=String(value||"").trim();
   const link=text.match(/https:\/\/alidocs\.dingtalk\.com\/i\/nodes\/[A-Za-z0-9]+/);
@@ -172,13 +195,11 @@ async function writeAndVerify(source) {
   if (!targetHeaders.some(Boolean)) {
     const info=await mcpCall("get_sheet",{nodeId:WORKBOOK,sheetId});
     if (info.nonEmptyRange || Number(info.lastNonEmptyRow)>=0) throw new Error("DINGTALK_HEADER_EMPTY_WITH_EXISTING_DATA");
-    targetHeaders=[...source.headers];
+    targetHeaders=source.headers.filter(header=>header!=="is_page_get_coupon");
   }
   if (targetHeaders.length !== EXPECTED_COLUMN_COUNT || targetHeaders.some(header => !header)) throw new Error(`DINGTALK_HEADER_INVALID:${targetHeaders.length}`);
   if (new Set(targetHeaders).size!==targetHeaders.length) throw new Error("DINGTALK_HEADER_DUPLICATED");
-  const missing = targetHeaders.filter(header => !source.headers.includes(header));
-  if (missing.length) throw new Error(`CRM_MISSING_TARGET_COLUMNS:${missing.join("|")}`);
-  const tableRows = source.rows.map(row => Object.fromEntries(targetHeaders.map(header => [header,row[header] ?? ""])));
+  const tableRows = projectTargetRows(source,targetHeaders);
   validateSource(targetHeaders,tableRows);
   const infoBefore = await mcpCall("get_sheet",{nodeId:WORKBOOK,sheetId});
   const previousLastRow = Number(infoBefore.nonEmptyRange?.lastRow || (Number(infoBefore.lastNonEmptyRow)+1) || 1);
@@ -251,8 +272,7 @@ async function main() {
   const selectedMonth=String(source.renewalMonth||"");
   if (!/^\d{4}-(0[1-9]|1[0-2])-01$/.test(selectedMonth)) throw new Error("CRM_RENEWAL_MONTH_INVALID");
   FILTERS["续费月份"]=selectedMonth;
-  source.headers=source.headers.map(normalizeText);
-  if(source.headers.length!==EXPECTED_COLUMN_COUNT || source.headers.some(header=>!header) || new Set(source.headers).size!==source.headers.length)throw new Error("CRM_HEADERS_INVALID");
+  normalizeSourceHeaders(source);
   if(source.rowcount!=null && Number(source.rowcount)!==source.rows.length)throw new Error("CRM_ROW_COUNT_MISMATCH");
   validateSource(source.headers,source.rows);
   console.log(`CRM_OK rows=${source.rows.length} columns=${source.headers.length}`);
@@ -285,6 +305,10 @@ const task=process.argv.includes("--self-test") ? Promise.resolve().then(selfTes
   ? updateDashboardTimestamp().then(timestamp=>console.log(`DASHBOARD_TIMESTAMP_OK time=${timestamp}`))
   : main();
 task.catch(error=>{
-  console.error(String(error?.message||error));
+  const message=String(error?.message||error);
+  try {
+    fs.writeFileSync(path.join(RUNTIME_ROOT,"renewal-error.json"),JSON.stringify({time:new Date().toISOString(),message,...(error.schema?{schema:error.schema}:{})}),"utf8");
+  } catch {}
+  console.error(message);
   process.exitCode=1;
 });

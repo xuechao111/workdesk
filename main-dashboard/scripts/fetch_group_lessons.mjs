@@ -48,15 +48,35 @@ for(let i=0;i<classes.length;i++){
   const weeks=[...new Set(opened.map(x=>openedWeek(x.unlock_time)))].sort((a,b)=>b-a).slice(0,2);
   // The CRM endpoint rejects page sizes above 100 with HTTP 400.
   const courseIds=opened.filter(x=>weeks.includes(openedWeek(x.unlock_time))).map(x=>x.course_id); const items=[]; const pageSize=100;
-  for(let offset=0;offset<courseIds.length;offset+=courseChunkSize){
-    const ids=courseIds.slice(offset,offset+courseChunkSize); const openCourseList=ids.map(courseId=>({courseId,paramValue:[0,1],isAllSelect:true}));
-    let pageNo=1;
+  const coursesByUnlock=new Map();
+  for(const lesson of opened.filter(x=>weeks.includes(openedWeek(x.unlock_time)))){
+    const unlock=Number(lesson.unlock_time);
+    if(!coursesByUnlock.has(unlock))coursesByUnlock.set(unlock,[]);
+    coursesByUnlock.get(unlock).push(lesson.course_id);
+  }
+  const courseBatches=[...coursesByUnlock.values()].flatMap(ids=>{
+    const batches=[];
+    for(let offset=0;offset<ids.length;offset+=courseChunkSize)batches.push(ids.slice(offset,offset+courseChunkSize));
+    return batches;
+  });
+  for(const ids of courseBatches){
+    const openCourseList=ids.map(courseId=>({courseId,paramValue:[0,1],isAllSelect:true}));
+    let pageNo=1; const pairLearnerIds=new Set();
     while(true){
       const body={term_id:termId,class_id:classId,course_ids:ids,time_type:1,openCourseList,queryType:2};
       let resp; for(let attempt=1;attempt<=3;attempt++){try{resp=await api(`https://api-codecamp-crm.codemao.cn/annual/class/course-detail?page=${pageNo}&limit=${pageSize}`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});break;}catch(e){if(attempt===3)throw e;await new Promise(r=>setTimeout(r,1000*attempt));}}
-      const rows=resp.items||resp.data?.items||[]; items.push(...rows);
-      const total=Number(resp.total??resp.data?.total??rows.length); console.log(`  courses=${offset+1}-${offset+ids.length} page=${pageNo} rows=${rows.length} total=${total}`);
-      if(!rows.length||pageNo*pageSize>=total)break; pageNo++;
+      const rows=resp.items||resp.data?.items||[];
+      if(!Array.isArray(rows))throw new Error(`CRM_DETAIL_INVALID:${classId}:${pageNo}`);
+      for(const row of rows)if(row.user_id!==undefined&&row.user_id!==null)pairLearnerIds.add(String(row.user_id));
+      items.push(...rows);
+      const total=Number(resp.total??resp.data?.total??rows.length); console.log(`  courses=${ids.join(',')} page=${pageNo} rows=${rows.length} total=${total}`);
+      if(!Number.isFinite(total)||total<0)throw new Error(`CRM_DETAIL_INVALID:${classId}:${pageNo}`);
+      // total counts learners; rows contains one record per selected course.
+      if(!rows.length||pageNo*pageSize>=total){
+        if(total>pageSize&&pairLearnerIds.size<total)throw new Error(`CRM_DETAIL_INCOMPLETE:${classId}:${pageNo}:${pairLearnerIds.size}/${total}`);
+        break;
+      }
+      pageNo++;
     }
   }
   const merged=new Map();

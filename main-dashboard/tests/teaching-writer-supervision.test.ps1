@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'run-direct-from-extension.ps1')
 $runtime = (Get-Process -Id $PID).Path
 $fixture = Join-Path $PSScriptRoot ('writer-supervision-' + [Guid]::NewGuid().ToString('N'))

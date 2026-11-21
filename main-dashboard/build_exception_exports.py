@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from teaching_metrics import course_detail_rows, lesson_pairs
 from runtime_paths import runtime_root
 ROOT = runtime_root()
 RAW = ROOT / "run-data" / "group-lessons-raw.json"
@@ -383,23 +384,10 @@ def main():
     current = monday(now)
     opened_weeks = set()
     for block in blocks:
-        lessons_by_time = {}
-        populated_course_ids = {
-            int(item.get("course_id") or 0)
-            for item in block.get("items", [])
-            if int(item.get("course_id") or 0) > 0
-        }
-        for lesson in block.get("lessons", []):
-            unlock_time = int(lesson.get("unlock_time") or 0)
-            if int(lesson.get("course_number") or 0) > 0 and unlock_time > 0:
-                lessons_by_time.setdefault(unlock_time, []).append(lesson)
-        for unlock_time, same_time_lessons in lessons_by_time.items():
-            ordered = sorted(same_time_lessons, key=lambda item: (int(item.get("course_number") or 0), int(item.get("course_id") or 0)))
-            if len(ordered) < 2:
-                continue
-            completion = ordered[1]
-            course_id = int(completion.get("course_id") or 0)
-            if 0 < unlock_time <= now and course_id in populated_course_ids:
+        populated_course_ids = {int(item.get("course_id") or 0) for item in block.get("items", [])}
+        for _first, completion in lesson_pairs(block):
+            unlock_time = int(completion.get("unlock_time") or 0)
+            if 0 < unlock_time <= now and int(completion.get("course_id") or 0) in populated_course_ids:
                 opened_weeks.add(monday(unlock_time))
     has_current = current in opened_weeks
     start = current if has_current else max((week for week in opened_weeks if week <= current), default=current - 7 * 86400)
@@ -437,11 +425,6 @@ def main():
         class_id = int(block.get("classId") or info.get("classId") or 0)
         class_name = str(info.get("className") or "")
         lessons = [lesson for lesson in block["lessons"] if int(lesson.get("course_number") or 0) > 0]
-        lessons_by_time = {}
-        for lesson in sorted(lessons, key=lambda item: (int(item.get("unlock_time") or 0), int(item.get("course_number") or 0), int(item.get("course_id") or 0))):
-            unlock_time = int(lesson.get("unlock_time") or 0)
-            if unlock_time:
-                lessons_by_time.setdefault(unlock_time, []).append(lesson)
         items = block.get("items", [])
         slot = schedule_label(items, f"{info.get('termName', '')} {info.get('className', '')}", lessons)
         roster = {str(x.get("user_id")): str(x.get("child_name") or x.get("nickname") or "") for x in items if x.get("user_id")}
@@ -455,26 +438,17 @@ def main():
         main_term_label = term_first_labels.get(main_term, str(main_term))
         teacher_key = (main_term_label, teacher)
         teacher_total = overview.setdefault(teacher_key, {"classes": set(), "arrival_expected": 0, "arrival_attend": 0, "live_expected": 0, "live_attend": 0, "finish_expected": 0, "finished": 0, "arrived_unfinished": 0, "unarrived": 0, "incomplete_ids": set(), "arrived_ids": set(), "live_absent_ids": set(), "replay_ids": set()})
-        # CRM course numbers are not guaranteed to remain odd/even or
-        # contiguous (older cohorts can reach 60 and some templates skip
-        # numbers). The two lessons sharing the same unlock time are the real
-        # weekly live/completion pair.
-        lesson_pairs = []
-        for unlock_time, same_time_lessons in sorted(lessons_by_time.items()):
-            ordered = sorted(same_time_lessons, key=lambda item: (int(item.get("course_number") or 0), int(item.get("course_id") or 0)))
-            if len(ordered) >= 2:
-                lesson_pairs.append((ordered[0], ordered[1]))
-        for first, even in lesson_pairs:
+        for first, even in lesson_pairs(block):
             live_number = int(first.get("course_number") or 0)
             even_time = int(even.get("unlock_time") or 0)
-            even_rows = [x for x in items if int(x.get("course_id") or 0) == int(even.get("course_id") or 0)]
+            even_rows = course_detail_rows(block, even)
             first_time = int(first.get("unlock_time") or 0)
-            first_rows = [x for x in items if int(x.get("course_id") or 0) == int(first.get("course_id") or 0)]
+            first_rows = course_detail_rows(block, first)
             first_arrived_ids = {str(x.get("user_id")) for x in first_rows if x.get("user_id") and bool(x.get("is_open"))}
             pair_open = start <= even_time < end and even_time <= now
             if pair_open:
                 finished_ids = {str(x.get("user_id")) for x in even_rows if x.get("user_id") and bool(x.get("is_finish"))}
-                arrived_unfinished_ids = first_arrived_ids - finished_ids
+                arrived_unfinished_ids = (first_arrived_ids & {str(row["user_id"]) for row in even_rows}) - finished_ids
                 teacher_total["classes"].add(class_id)
                 teacher_total["finish_expected"] += len(even_rows)
                 teacher_total["finished"] += sum(bool(x.get("is_finish")) for x in even_rows)
@@ -505,9 +479,9 @@ def main():
                 board = (block.get("liveAttendance") or {}).get(str(live_number)) or (block.get("liveAttendance") or {}).get(live_number)
                 if not board:
                     continue
-                attended_ids = set(str(x) for x in (board or {}).get("attendedIds", []))
                 expected_ids = set(str(x) for x in (board or {}).get("expectedIds", []))
-                absent_ids = set(str(x) for x in (board or {}).get("absentIds", []))
+                attended_ids = set(str(x) for x in (board or {}).get("attendedIds", [])) & expected_ids
+                absent_ids = expected_ids - attended_ids
                 live_expected = len(expected_ids) if board else len(live_items)
                 live_attend = len(attended_ids) if board else sum(attended(x) for x in live_items)
                 teacher_total["classes"].add(class_id)
@@ -520,7 +494,7 @@ def main():
                 for row in live_items:
                     uid = str(row.get("user_id") or "")
                     is_timely = uid in attended_ids if board else attended(row)
-                    if uid and not is_timely and (int(row.get("watch_time") or 0) > 0 or float(row.get("watch_process") or 0) > 0):
+                    if uid in expected_ids and not is_timely and (int(row.get("watch_time") or 0) > 0 or float(row.get("watch_process") or 0) > 0):
                         replayed_ids.add(uid)
                         teacher_total["replay_ids"].add(uid)
                         replay_students[(teacher, class_id, uid, live_number)] = [teacher, roster.get(uid, ""), uid, slot, class_id, class_name, live_number, int(row.get("watch_time") or 0), float(row.get("watch_process") or 0) / 100, period]

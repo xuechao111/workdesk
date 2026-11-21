@@ -370,14 +370,26 @@ async function collectCrmData(classes,excludedTeachers=["薛超"],onProgress=asy
           const selected=opened.filter(x=>weeks.includes(openedWeek(x.unlock_time)));
           if(selected.length)windowStart=Math.min(windowStart,...selected.map(x=>Number(x.unlock_time)));
           const courseIds=selected.map(x=>x.course_id);
+          const coursesByUnlock=new Map();
+          for(const lesson of selected){
+            const unlock=Number(lesson.unlock_time);
+            if(!coursesByUnlock.has(unlock))coursesByUnlock.set(unlock,[]);
+            coursesByUnlock.get(unlock).push(lesson.course_id);
+          }
+          const courseBatches=[...coursesByUnlock.values()].flatMap(ids=>{
+            const batches=[];
+            for(let offset=0;offset<ids.length;offset+=2)batches.push(ids.slice(offset,offset+2));
+            return batches;
+          });
           const items=[];
           // The learner-detail endpoint returns only the latest weekly pair
           // when multiple weeks are submitted together. Fetch one odd/even
           // pair at a time so the prior week's odd-course live baseline is
           // preserved for same-slot Gap comparisons.
-          for(let offset=0;offset<courseIds.length;offset+=2){
-            const ids=courseIds.slice(offset,offset+2),openCourseList=ids.map(courseId=>({courseId,paramValue:[0,1],isAllSelect:true}));
-            let pageNo=1,pairItemCount=0;
+          for(const ids of courseBatches){
+            const openCourseList=ids.map(courseId=>({courseId,paramValue:[0,1],isAllSelect:true}));
+            let pageNo=1;
+            const pairLearnerIds=new Set();
             while(true){
               const body={term_id:termId,class_id:classId,course_ids:ids,time_type:1,openCourseList,queryType:2};
               // CRM caps this endpoint at 100 rows per page. Larger values
@@ -389,10 +401,16 @@ async function collectCrmData(classes,excludedTeachers=["薛超"],onProgress=asy
               const rows=resp.items||resp.data?.items||[];
               const total=Number(resp.total??resp.data?.total??rows.length);
               if(!Array.isArray(rows)||!Number.isFinite(total)||total<0)throw new Error(`CRM_DETAIL_INVALID:${classId}:${pageNo}`);
-              pairItemCount+=rows.length;
-              if(!rows.length&&pairItemCount<total)throw new Error(`CRM_DETAIL_INCOMPLETE:${classId}:${pageNo}:${pairItemCount}/${total}`);
+              for(const row of rows)if(row.user_id!==undefined&&row.user_id!==null)pairLearnerIds.add(String(row.user_id));
+              if(!rows.length&&pairLearnerIds.size<total)throw new Error(`CRM_DETAIL_INCOMPLETE:${classId}:${pageNo}:${pairLearnerIds.size}/${total}`);
               items.push(...rows);
-              if(!rows.length||pairItemCount>=total)break;
+              // CRM paginates learners; each learner contributes one row per
+              // selected course. Comparing expanded row count with learner
+              // total truncates classes over 100 learners after the first page.
+              if(!rows.length||pageNo*detailPageSize>=total){
+                if(total>detailPageSize&&pairLearnerIds.size<total)throw new Error(`CRM_DETAIL_INCOMPLETE:${classId}:${pageNo}:${pairLearnerIds.size}/${total}`);
+                break;
+              }
               pageNo++;
             }
           }
@@ -780,6 +798,21 @@ async function fetchServiceInCurrentChrome(requestedSelection){
   if(!tabs.length)return {ok:false,error:"请先在当前谷歌浏览器打开并登录 Superset CRM；控制台不会另开页面。"};
   const tab=tabs.find(x=>x.active&&!x.discarded)||tabs.find(x=>!x.discarded)||tabs[0];
   const serviceSelection=normalizeServiceSelection(requestedSelection),dates=serviceSelectedDates(serviceSelection),todayDate=serviceTodayDate(serviceSelection);
+  // Coverage always uses each teacher's course start and full days, independently
+  // of the service weekday/hour filters. Roster IDs bound both numerator and denominator.
+  try{
+    const response=await fetchWithTimeout(`${LOCAL_BASE}/dashboard-data`,{cache:"no-store"},20000);
+    if(!response.ok)throw new Error(`HTTP_${response.status}`);
+    const snapshot=await response.json(),plans=new Map(),endDate=new Date().toLocaleDateString("en-CA",{timeZone:"Asia/Shanghai"});
+    for(const item of snapshot.classes||[]){
+      const teacher=String(item.teacher||"").trim(),startDate=String(item.cohortDate||"").slice(0,10);
+      if(!teacher||!/^\d{4}-\d{2}-\d{2}$/.test(startDate))continue;
+      if(!plans.has(teacher))plans.set(teacher,{teacher,startDate,endDate,studentIds:[]});
+      const plan=plans.get(teacher);if(startDate<plan.startDate)plan.startDate=startDate;
+      plan.studentIds.push(...(item.students||[]).map(row=>String(row.id||"")).filter(Boolean));
+    }
+    serviceSelection.videoCoveragePlans=[...plans.values()].map(plan=>({...plan,studentIds:[...new Set(plan.studentIds)]}));
+  }catch(error){serviceSelection.videoCoverageError=String(error?.message||error);}
   try{
     await waitForTabReady(tab.id);
     const results=await Promise.race([chrome.scripting.executeScript({
@@ -964,6 +997,42 @@ async function fetchServiceInCurrentChrome(requestedSelection){
           };
           return {fetchRange,fetchDaily};
         };
+        const fetchVideoCoverage=async teacherNames=>{
+          try{
+            const plans=(serviceSelection.videoCoveragePlans||[]).filter(plan=>teacherNames.includes(plan.teacher));
+            if(!plans.length)throw new Error(serviceSelection.videoCoverageError||"VIDEO_COVERAGE_ROSTER_MISSING");
+            const chartPayload=await api("/api/v1/chart/2458"),chart=chartPayload.result||chartPayload,template=JSON.parse(chart.query_context||"{}"),datasetId=template.datasource?.id;
+            if(!datasetId)throw new Error("VIDEO_COVERAGE_DATASET_MISSING");
+            let dataset=null;
+            try{const payload=await api(`/api/v1/dataset/${datasetId}`);dataset=payload.result||payload;}catch(error){if(!String(error?.message||error).includes("CRM_HTTP_403"))throw error;}
+            const savedMetrics=(template.queries||[]).flatMap(query=>query.metrics||[]),savedName=["video_succuess_cnt","video_success_cnt"].find(name=>savedMetrics.includes(name));
+            // Dataset metadata can be restricted while the saved dashboard metric is
+            // authorized. Reuse that existing learner-count metric via chart/data.
+            const metric=dataset?(dataset.metrics||[]).find(item=>["video_succuess_cnt","video_success_cnt"].includes(item.metric_name)):(savedName?{metric_name:savedName}:null);
+            if(!metric||dataset&&!(/count\s*\(\s*distinct\b/i.test(metric.expression||"")))throw new Error("VIDEO_COVERAGE_DISTINCT_METRIC_REQUIRED");
+            const physical=dataset?(dataset.columns||[]).map(column=>column.column_name):["user_id","send_date","beisen_user_fullname"],studentColumn=["user_id","student_id","uid"].find(column=>physical.includes(column));
+            if(!studentColumn||!physical.includes("send_date")||!physical.includes("beisen_user_fullname"))throw new Error("VIDEO_COVERAGE_ROSTER_FILTER_MISSING");
+            const rows=[],errors={};
+            // Query one teacher/range at a time; never add per-day DISTINCT counts.
+            for(const plan of plans){
+              if(!plan.studentIds.length||plan.startDate>plan.endDate)continue;
+              try{
+                const query=JSON.parse(JSON.stringify(template)),end=new Date(`${plan.endDate}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+1);
+                const timeRange=`${plan.startDate}T00:00:00 : ${end.toISOString().slice(0,10)}T00:00:00`,filters=[{col:"send_date",op:"TEMPORAL_RANGE",val:timeRange},{col:"beisen_user_fullname",op:"IN",val:[plan.teacher]},{col:studentColumn,op:"IN",val:plan.studentIds}];
+                query.queries=[{...(query.queries?.[0]||{}),columns:["worker_no","beisen_user_fullname"],groupby:["worker_no","beisen_user_fullname"],metrics:[metric.metric_name],filters,time_range:timeRange,row_limit:200000,row_offset:0,orderby:[],post_processing:[],extras:{where:"",having:""}}];
+                query.force=true;query.form_data={...(query.form_data||{}),time_range:timeRange,extra_form_data:{filters,time_range:timeRange}};
+                const headers={"content-type":"application/json"};if(csrf)headers["x-csrftoken"]=csrf;
+                const payload=await api("/api/v1/chart/data",{method:"POST",headers,body:JSON.stringify(query)}),result=payload.result?.[0];
+                if(!Array.isArray(result?.data)||Number(result.rowcount||0)>result.data.length)throw new Error("VIDEO_COVERAGE_RESPONSE_INVALID");
+                if(result.data.length>1)throw new Error("VIDEO_COVERAGE_TEACHER_NOT_UNIQUE");
+                const row=result.data[0],rawUsers=row?.[metric.metric_name];if(row&&(rawUsers==null||rawUsers===""))throw new Error("VIDEO_COVERAGE_METRIC_MISSING");const users=row?Number(rawUsers):0;
+                if(!Number.isInteger(users)||users<0||users>plan.studentIds.length||row&&String(row.beisen_user_fullname).trim()!==plan.teacher)throw new Error("VIDEO_COVERAGE_COUNT_INVALID");
+                rows.push({worker_no:row?.worker_no||"",beisen_user_fullname:plan.teacher,videoCallUsers:users,videoCoverageTotal:plan.studentIds.length,startDate:plan.startDate,endDate:plan.endDate});
+              }catch(error){errors[plan.teacher]=String(error?.message||error);}
+            }
+            return {startDate:plans.map(plan=>plan.startDate).sort()[0],endDate:plans[0].endDate,status:"complete",errors,im:{teacher:{granular:false,aggregation:"summary-chart",headers:["worker_no","beisen_user_fullname","videoCallUsers"],rows}}};
+          }catch(error){return {status:"error",error:String(error?.message||error)};}
+        };
         const [imDashboard,wecomDashboard]=await Promise.all([fetchDashboard(382,"im"),fetchDashboard(337,"wecom")]);
         const [im,wecom]=await Promise.all([imDashboard.fetchRange(dates),wecomDashboard.fetchRange(dates)]);
         let today=null;
@@ -972,7 +1041,8 @@ async function fetchServiceInCurrentChrome(requestedSelection){
           const errors={};for(const [kind,value] of [["im",todayIm],["wecom",todayWecom]])for(const [dimension,error] of Object.entries(value.errors))errors[`${kind}.${dimension}`]=error;
           today={dates:[todayDate],im:todayIm,wecom:todayWecom,errors,status:Object.keys(errors).length?"partial":"ok"};
         }
-        return JSON.stringify({dates,im,wecom,today,serviceSelection});
+        const videoCoverage=await fetchVideoCoverage([...new Set([...(im.teacher?.rows||[]),...(wecom.teacher?.rows||[])].map(row=>String(row.beisen_user_fullname||"")))]);
+        return JSON.stringify({dates,im,wecom,today,serviceSelection,videoCoverage});
       }catch(error){return JSON.stringify({__serviceError:String(error?.message||error)});}
       }
     }),new Promise((_,reject)=>setTimeout(()=>reject(new Error("CRM_SERVICE_TOTAL_TIMEOUT")),240000))]);
@@ -1403,7 +1473,7 @@ chrome.runtime.onMessage.addListener((message,sender,sendResponse)=>{
   if(message?.source!=="codemao-dashboard")return;
   if(!/^http:\/\/(127\.0\.0\.1|localhost):8765$/.test(String(message.localBase||""))||(sender?.url&&!/^http:\/\/(127\.0\.0\.1|localhost):8765(?:\/|$)/.test(sender.url))){sendResponse({ok:false,error:"此连接器仅支持主工作台8765，已拒绝其他工作台请求"});return;}
   if(message.connectorId&&message.connectorId!==chrome.runtime.id)return;
-  if(message.type==="ping"){leaseMcpRelay(normalizeLocalBase(message.localBase));sendResponse({ok:true,version:chrome.runtime.getManifest().version,instance:"main",port:8765,extensionId:chrome.runtime.id,build:"main-refresh-recovery-79"});return;}
+  if(message.type==="ping"){leaseMcpRelay(normalizeLocalBase(message.localBase));sendResponse({ok:true,version:chrome.runtime.getManifest().version,instance:"main",port:8765,extensionId:chrome.runtime.id,build:"main-teaching-pagination-82"});return;}
   if(message.type==="reload-extension"){sendResponse({ok:true,reloading:true});setTimeout(()=>chrome.runtime.reload(),150);return;}
   if(message.type==='update-comparison'){
     runComparisonUpdate(message.localBase).then(sendResponse).catch(error=>sendResponse({ok:false,error:String(error.message||error)}));return true;

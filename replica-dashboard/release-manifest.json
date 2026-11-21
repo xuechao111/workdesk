@@ -1,12 +1,14 @@
 {
-  "version": "2026.11.13-workdesk",
-  "instance": "replica",
-  "port": 8766,
-  "connectorVersion": "1.6.77",
+  "version": "2026.11.21-replica-v24-cover-themes",
+  "connectorVersion": "1.6.80",
   "files": [
     {
-      "path": ".gitignore",
-      "sha256": "945796d93963b1668cae7eb245c2877a81130aafda1b456d0f57b60dbfc914e4"
+      "path": "DESIGN.md",
+      "sha256": "192dec2bc8105739f005c3fcbe9cd5b0b96996bfbd1ced985f99e1c58af57cc9"
+    },
+    {
+      "path": "README.md",
+      "sha256": "9d451bf73d122f9a763076788ccf0a167c47fa8afe76ab8fd1f4bf8fd4ade646"
     },
     {
       "path": "assets/codemao-logo.png",
@@ -18,7 +20,7 @@
     },
     {
       "path": "bridge.ps1",
-      "sha256": "5b3189f2f79724b5796b73514960b048dd2749ba8a4db61af56780173c13e3fa"
+      "sha256": "66871fee37e809eda3b8310a333f52c1bcca66124928355f432f0515de685326"
     },
     {
       "path": "broadcast_report.py",
@@ -34,15 +36,15 @@
     },
     {
       "path": "chrome-extension/background.js",
-      "sha256": "a77bda8d085fcbb02296fc72d3f289c644a7ab03766136637a0a41751162751f"
+      "sha256": "174a149b1f0a50359bda8e06f197d1015403debadfb376f781ebb2844611f909"
     },
     {
       "path": "chrome-extension/bridge.js",
-      "sha256": "f90fdc4fc311e0ced80daaa130c42a5619a8eb256ad5bdafa77fe440dcffc95b"
+      "sha256": "a29e73d20af23b8046776c2ec145ab7bc6e9035dc67357324740f8780347abeb"
     },
     {
       "path": "chrome-extension/manifest.json",
-      "sha256": "5f179fa0c6dc95a93dee3294fba8e80f6b41d42c34796bce1671a87a15835d47"
+      "sha256": "8c5c505f32da4f50389cdb4f77208380ae7bc6d141aba98207be040acf2b3e68"
     },
     {
       "path": "comparison_live_cache.py",
@@ -54,7 +56,7 @@
     },
     {
       "path": "dashboard-config.example.json",
-      "sha256": "cba4a4e92b46fba5bdf711c3d68c2da4b46e5c13a5ec54e2bb4471b3cf7ed2a1"
+      "sha256": "fa9be1494b31d7f22a62f3c4a019236de123f0507da090acdce311ade0f7c119"
     },
     {
       "path": "dashboard-config.portable.example.json",
@@ -90,11 +92,7 @@
     },
     {
       "path": "index.html",
-      "sha256": "68837fd73584802ddbb80914a71333cc4bd963bc1c37a564b7a91f524378cf47"
-    },
-    {
-      "path": "instance-guard.ps1",
-      "sha256": "b57d0ed7d8fecb92107554258addd9ce5011b73ca7aca15bc41b9a00c08f9797"
+      "sha256": "6be020f6611ed790d02d92a41756747bc83113711f7d4e01969d2b8881b85acd"
     },
     {
       "path": "launch-dashboard-hidden.vbs",
@@ -113,24 +111,12 @@
       "sha256": "401868fdbdc15d6b8ac82d94e619d8b65c955e1f80ae9945e63783049c73a338"
     },
     {
-      "path": "README.md",
-      "sha256": "11125a0775636ec5d36610fc41ab4c096150c9f8e55b2e511e83cd63652bbe05"
-    },
-    {
       "path": "repair-replica-update.ps1",
-      "sha256": "a9a9099edf6061d2e0510b5c1298f8b5df37395cba33dadacda5f42e9cf9c5dc"
-    },
-    {
-      "path": "replica-connection-guide.html",
-      "sha256": "f4a4d4941d1a8afae36c01d011db27ee4971f575b507143e40c9bf67f8f07d7a"
+      "sha256": "4c715e795a97b2b672e20040569aa430fea79fed8ac6d47ccc39ef62c4e7577c"
     },
     {
       "path": "replica-diagnostics.ps1",
       "sha256": "b340fdadcd66f513a993a4b3fbdffe504b87027327e7e650bd43e0aa69518b73"
-    },
-    {
-      "path": "requirements.txt",
-      "sha256": "0cb612ba53c8d8a5e083545b9cf1cb78ed3acb87ef54b619e2eed468b9b3d15d"
     },
     {
       "path": "restart-dashboard.ps1",
@@ -154,7 +140,7 @@
     },
     {
       "path": "run-scholarship-update.ps1",
-      "sha256": "6ac79e0cf690e487cc5efd4c0652a46a16edd2970036c4bb04b929d0b85bd930"
+      "sha256": "b529a0993b8b5a067d588a4baaec94b3385ef243392e13af43add652ea7c82a6"
     },
     {
       "path": "run-service-update.ps1",
@@ -162,11 +148,7 @@
     },
     {
       "path": "run_dashboard_update.py",
-      "sha256": "e4b3bd3a472e68611e7d5189010fefbc7cd2ab1022a3e8f334eb68236aee32ac"
-    },
-    {
-      "path": "runtime_paths.py",
-      "sha256": "5014e74cacbd4b4620bed511db6a3bfd906b8501e0955b0884cce816eaa90dda"
+      "sha256": "6f787c046139398a18e70eb1a340de4ab029d36565ccfbf1aa97797021c6188d"
     },
     {
       "path": "scripts/build_group_dashboard.mjs",
@@ -178,7 +160,7 @@
     },
     {
       "path": "self-update.ps1",
-      "sha256": "f9e83b16cf807bd636c893c1770589772d7d4b699801f457beb349e09ae0602f"
+      "sha256": "af9a287c3598c387a16c16ca4ae1617229f374de5a00324728959e2888b4913b"
     },
     {
       "path": "setup-workbench.ps1",
@@ -202,11 +184,11 @@
     },
     {
       "path": "sync-renewal-table.mjs",
-      "sha256": "7efc78c742a93d5c367b44d99effe9bf61d2d99eb850337674ddef084e92c8c8"
+      "sha256": "84aa55dd56e8d4fb5fac765b4e64a190483b2f6b2459ae49376b37b9c3b5aa6f"
     },
     {
       "path": "sync-service-data.mjs",
-      "sha256": "bb6d39938e3801a827942b543b2ec7c6f08d6db32eb66466dc051dbea1623398"
+      "sha256": "3acb71a10def163771dac12131cea98cec7b5e335c867cdb0088b002495c604a"
     },
     {
       "path": "tests/broadcast-result.test.ps1",
@@ -225,28 +207,8 @@
       "sha256": "fb251b170e5fab83e9bb024edaa73187229d83c7b2f1e107303e47dad154d999"
     },
     {
-      "path": "tests/crm-auth.test.mjs",
-      "sha256": "0e134667f4defa0939bb100bd1c1fbfccf13226d87b5d77916115f9e5f27bf1e"
-    },
-    {
-      "path": "tests/crm-page-size.test.mjs",
-      "sha256": "e27c7af17fdd16789dfbcad85bf0fc8ebab4f650ad4c5ea1a46d7a0bad3a3906"
-    },
-    {
-      "path": "tests/crm-request-budget.test.mjs",
-      "sha256": "14b55281cbf6e9cbf58214c6b4b3f63f981e47a2b6b62e7547be4641ed830096"
-    },
-    {
       "path": "tests/fixtures/overview_styles_before_batching.py",
       "sha256": "d3211b74f5cbbdd86660d859a2b9120e82d282cc51bde084e9b0b22614270be9"
-    },
-    {
-      "path": "tests/instance-boundary.test.mjs",
-      "sha256": "69ca9147621a1b520a9e4fb72a389e1db195dd31fc6de98cc731ac995b379f57"
-    },
-    {
-      "path": "tests/instance-isolation.test.ps1",
-      "sha256": "d6a07656630e3091ef3846c3196a1e3582f255fbef4b4cbfb57fb24349f63fad"
     },
     {
       "path": "tests/live-board-match.test.mjs",
@@ -273,36 +235,16 @@
       "sha256": "51c336d21b089687b80dd61d5a2566239c76effbb2620d2a6647f127be6f0a65"
     },
     {
-      "path": "tests/renewal-all-groups.test.mjs",
-      "sha256": "a1bf70ce637628ef568a8cead8a69f484713d9eafaa6856e8d5e6585554a8204"
-    },
-    {
       "path": "tests/renewal-relay.test.mjs",
       "sha256": "aca304dea15cdbb9d2ec894312ded1ebdf85744d7f20b6db6901ac4561ec3e63"
     },
     {
-      "path": "tests/renewal-scope-guard.test.ps1",
-      "sha256": "079d6f21839252fe6a244bf64875fc6ddb7e2020e9bc7d163001ecdad41ad36b"
-    },
-    {
       "path": "tests/repair-replica-update.test.ps1",
-      "sha256": "0595bdd9a21db1e1b58ce11f95b97468feaa44d5bd55fead6ed5daf5c396258f"
-    },
-    {
-      "path": "tests/replica-client-start.test.mjs",
-      "sha256": "f3942167588de87b25ebafacb4ecb09838fc82125293b756b65bf4a8f4902761"
-    },
-    {
-      "path": "tests/replica-connector-isolation.test.mjs",
-      "sha256": "90fd3dc45663768ed6c0e493495fa6b5c796ff269b6e41b88c63f715a8eaa6d8"
-    },
-    {
-      "path": "tests/replica-launcher.test.ps1",
-      "sha256": "ca17229591071953ba20cf9721693466debf0bd86ff8c734e793fc9fa30bf526"
+      "sha256": "22513fa0147812ae1fb4497dfbd2b3e036d53bb440b779d1caedbe71050ae464"
     },
     {
       "path": "tests/replica-manual-isolation.test.ps1",
-      "sha256": "0d80816f11e471fe99e7702bf2eb6cd29b3c9183b7e5e2f41fc6ef20b65687b0"
+      "sha256": "3a35ab03ab9bdfa0c2e7e369cfa5975796a9d26b9678b29af914ad7c86feb55a"
     },
     {
       "path": "tests/replica-manual-worker.test.mjs",
@@ -318,7 +260,7 @@
     },
     {
       "path": "tests/service-daily.test.mjs",
-      "sha256": "26c2071df8f1a95015b2970ab22bf313c7846666b7dde74fd0a80f086496790b"
+      "sha256": "86e6cb953bea4fda8ca214cbe17de81228e60de7a8c193f4e5fcc29e50d45475"
     },
     {
       "path": "tests/service-metrics.test.mjs",
@@ -353,14 +295,6 @@
       "sha256": "84d0276c8ae2b127685922539d12c0ea3e663a6869a692b3718f3b0d23da9d6e"
     },
     {
-      "path": "tests/test_exception_cohort_alignment.py",
-      "sha256": "ac437c6bb82ec67c9ab5169fe629cdd23c708ad053c31d3637d2a3eb8047999c"
-    },
-    {
-      "path": "tests/test_instance_boundary.py",
-      "sha256": "ff226f09507d9ba56e7d0c73da43d25ce06865789efb57c9fc9a506609d90b47"
-    },
-    {
       "path": "tests/test_live_pending.py",
       "sha256": "ce9aa581cc32601f5f6284996a639f7de2e55705bf86d49cac0fd79903dfbb3d"
     },
@@ -389,10 +323,6 @@
       "sha256": "97c1cb57e5a8b6985a3a1a1d2f07e869e74fa3864fc8a86119fd4624f97d1a3b"
     },
     {
-      "path": "tests/workdesk-package-selection.test.ps1",
-      "sha256": "68de52cc0c2d96ec3f242e1f192615f518a283cf5b7b74a29eaafeb8ad68d3db"
-    },
-    {
       "path": "update-workbench.ps1",
       "sha256": "eb3bb32defc3bc4007f79895db08fe265f5120b29597f0b4ca4649196ed93098"
     },
@@ -413,12 +343,12 @@
       "sha256": "e66efd2a12a003ff336ed1f61762487d9a8088e4dcc5b1442863a8a81df69d45"
     },
     {
-      "path": "一键修复副本.bat",
-      "sha256": "c663cf2c5dba8467912aba929bb7b2a8455aea2c02ae517c7eb57270d485573a"
-    },
-    {
       "path": "一键更新工作台.bat",
       "sha256": "0207c15025dedc5d3311e0ea600768d4c6430af6a9e11f1ee921532dca43e6dd"
+    },
+    {
+      "path": "使用说明.txt",
+      "sha256": "366674bb5e67264f7d743cd785ffe13b52c079eda616fa011da77c97b2cba05c"
     },
     {
       "path": "修复副本更新失败.bat",
@@ -439,6 +369,116 @@
     {
       "path": "首次安装一键配置.bat",
       "sha256": "c894516790cadebf65a26d41a4af2c43f842df0c64744d9abc6a007e1322a1da"
+    },
+    {
+      "path": "tests/crm-page-size.test.mjs",
+      "sha256": "e27c7af17fdd16789dfbcad85bf0fc8ebab4f650ad4c5ea1a46d7a0bad3a3906"
+    },
+    {
+      "path": "副本检查修复记录.md",
+      "sha256": "562ae7f9e13e1b996031534182c89b86d8a1898c1d87ddb49c83f711616df576"
+    },
+    {
+      "path": "tests/crm-auth.test.mjs",
+      "sha256": "0e134667f4defa0939bb100bd1c1fbfccf13226d87b5d77916115f9e5f27bf1e"
+    },
+    {
+      "path": "tests/crm-request-budget.test.mjs",
+      "sha256": "14b55281cbf6e9cbf58214c6b4b3f63f981e47a2b6b62e7547be4641ed830096"
+    },
+    {
+      "path": "tests/renewal-all-groups.test.mjs",
+      "sha256": "a1bf70ce637628ef568a8cead8a69f484713d9eafaa6856e8d5e6585554a8204"
+    },
+    {
+      "path": "tests/renewal-scope-guard.test.ps1",
+      "sha256": "079d6f21839252fe6a244bf64875fc6ddb7e2020e9bc7d163001ecdad41ad36b"
+    },
+    {
+      "path": "tests/replica-client-start.test.mjs",
+      "sha256": "f3942167588de87b25ebafacb4ecb09838fc82125293b756b65bf4a8f4902761"
+    },
+    {
+      "path": "tests/replica-connector-isolation.test.mjs",
+      "sha256": "d470963549fe38a88e017e4e1e1656b9e16d24ec591886a08dfaa709af0977ee"
+    },
+    {
+      "path": "一键修复副本.bat",
+      "sha256": "c663cf2c5dba8467912aba929bb7b2a8455aea2c02ae517c7eb57270d485573a"
+    },
+    {
+      "path": "replica-connection-guide.html",
+      "sha256": "306197c19bafc5ac16b6051a2dcbfd7683729805b1c2401e8feff50620ab6864"
+    },
+    {
+      "path": "tests/replica-launcher.test.ps1",
+      "sha256": "ca17229591071953ba20cf9721693466debf0bd86ff8c734e793fc9fa30bf526"
+    },
+    {
+      "path": "tests/test_exception_cohort_alignment.py",
+      "sha256": "ac437c6bb82ec67c9ab5169fe629cdd23c708ad053c31d3637d2a3eb8047999c"
+    },
+    {
+      "path": "完整版安装说明.md",
+      "sha256": "d8d8414c2a8a5156b4dcd71fd4290b8ebaab101e91d5905099b079298dc36ca0"
+    },
+    {
+      "path": "instance-guard.ps1",
+      "sha256": "b57d0ed7d8fecb92107554258addd9ce5011b73ca7aca15bc41b9a00c08f9797"
+    },
+    {
+      "path": "runtime_paths.py",
+      "sha256": "5014e74cacbd4b4620bed511db6a3bfd906b8501e0955b0884cce816eaa90dda"
+    },
+    {
+      "path": "tests/instance-boundary.test.mjs",
+      "sha256": "69ca9147621a1b520a9e4fb72a389e1db195dd31fc6de98cc731ac995b379f57"
+    },
+    {
+      "path": "tests/instance-isolation.test.ps1",
+      "sha256": "d6a07656630e3091ef3846c3196a1e3582f255fbef4b4cbfb57fb24349f63fad"
+    },
+    {
+      "path": "tests/test_instance_boundary.py",
+      "sha256": "ff226f09507d9ba56e7d0c73da43d25ce06865789efb57c9fc9a506609d90b47"
+    },
+    {
+      "path": "tests/renewal-empty-results.test.mjs",
+      "sha256": "b4af75b3a8b42da6d73a5facb6fd7a98a0cfeb259068128adf0e00e3d3e75a0a"
+    },
+    {
+      "path": "tests/renewal-schema-growth.test.mjs",
+      "sha256": "096ad229e1027b16dba189019989536a382aa3d25f77cc92cd359ea410b24aa3"
+    },
+    {
+      "path": "tests/renewal-error-encoding.test.mjs",
+      "sha256": "e48f9b2221bacd0c7b8e8f28aa370b54a576a6c6795499f10695d006a15a615e"
+    },
+    {
+      "path": "tests/service-group-scope.test.mjs",
+      "sha256": "416a83b1341b994dc700ded386671c6c2045488bb409de99ce7cd8cf1b195f9f"
+    },
+    {
+      "path": "tests/test_rolling_period_verification.py",
+      "sha256": "9c3ca300059573f7296f1fa8ac2e6ec32682d5a1504fcabd5a1eaecafc6059bb"
+    },
+    {
+      "path": "tests/config-save.test.ps1",
+      "sha256": "ffb4423ff407f9fec7151e6da7221dc869a8bb11bfd7a0c4b6f88a1fd436a176"
+    },
+    {
+      "path": "tests/config-save-readback.test.mjs",
+      "sha256": "78de20cd0e80bd45b3e61cd94bf76b1c59ff4c3f49f7c90e0b8666f0eb917014"
+    },
+    {
+      "path": "tests/cover-themes.test.mjs",
+      "sha256": "62a6ae71fec8bbf54c631e68c42d46f96c443c5a5e817e746d7ad155f8ac56a5"
+    },
+    {
+      "path": "tests/fixtures/main-cover.html",
+      "sha256": "678c1fba9db6a7332db6ea583b5e2e7b64fb794ea6558ea56e6e1bed87bfef45"
     }
-  ]
+  ],
+  "instance": "replica",
+  "port": 8766
 }
