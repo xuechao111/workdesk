@@ -1,5 +1,5 @@
 {
-  "version": "2026.11.22-main-character-themes",
+  "version": "2026.11.22-main-workspace-themes",
   "instance": "main",
   "port": 8765,
   "connectorVersion": "1.6.82",
@@ -94,7 +94,7 @@
     },
     {
       "path": "index.html",
-      "sha256": "aba1cecf5cc5af23dc7e6611cb673deeb744de59a3295eaf677fb61c7208a1c3"
+      "sha256": "13070de50b600cb9e739956443dc6036c6491c06c987dca1c74b150a5697b023"
     },
     {
       "path": "instance-guard.ps1",
